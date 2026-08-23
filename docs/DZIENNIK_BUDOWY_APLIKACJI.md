@@ -65,7 +65,7 @@ na urządzeniu.
 
 ## 3. Stos technologiczny
 
-Stan na 2026-08-22:
+Stan na 2026-08-23:
 
 | Obszar | Rozwiązanie |
 | --- | --- |
@@ -1346,6 +1346,494 @@ Sama liczba znaków nie opisuje geometrii tablicy dwurzędowej.
 
 ---
 
+## 2026-08-23 — filtr klas MP, warianty R0/R1/R2, nadrzędny tryb eksperymentalny i kontrolowana sesja pomiarowa
+
+### Problem
+
+Dalsze wykorzystanie modelu pojazdów MP jako pierwszego etapu kaskady wymagało
+rozwiązania kilku niezależnych problemów badawczych i wykonawczych:
+
+- MP zwracał detekcje wszystkich klas dostępnych w modelu COCO, podczas gdy
+  tylko część z nich ma sens jako źródło ROI dla tablicy rejestracyjnej;
+- stały limit dwóch ROI był zaszyty w pipeline i nie pozwalał wykonać czystego
+  eksperymentu porównującego pełną klatkę z jednym i dwoma ROI;
+- pierwsza wersja wyboru R0/R1/R2 modyfikowała normalną konfigurację MP, przez
+  co po zakończeniu eksperymentu nie było jednoznaczne, czy stan grafu wynika
+  z ustawienia użytkownika, czy z wariantu eksperymentalnego;
+- kamera uruchamiała się automatycznie wraz z `MainActivity`, więc część
+  inferencji i metryk powstawała jeszcze przed przygotowaniem stanowiska;
+- czas raportu był związany z życiem `MetricsCollector`, a nie z faktycznym
+  przedziałem pomiarowym;
+- potrzebny był punkt startowy do późniejszego rozszerzenia eksperymentów o
+  opcjonalne ograniczenie czasowe.
+
+### Rozwiązanie — filtr klas modelu pojazdów
+
+W `MobileAlprEngine` dodano filtrowanie wyników MP przed przekazaniem ich do
+`VehicleRoiSelector`.
+
+Dla modelu COCO dopuszczane są klasy odpowiadające pojazdom:
+
+```text
+car
+motorcycle
+bus
+truck
+```
+
+W testowanym manifeście odpowiadały one indeksom:
+
+```text
+[2, 3, 5, 7]
+```
+
+Jeżeli model ma niestandardową listę klas i nie uda się rozpoznać żadnej klasy
+pojazdu, zachowywany jest bezpieczny fallback dopuszczający wszystkie etykiety,
+aby nie zablokować modelu wyspecjalizowanego wyłącznie w pojazdach.
+
+Do `InferenceTrace` dodano liczniki:
+
+```text
+vehicle_detections_raw
+vehicle_detections_used
+vehicle_detections_rejected_class
+vehicle_regions_selected
+```
+
+W kontrolowanym przebiegu diagnostycznym MP zwrócił łącznie:
+
+```text
+raw detections       = 110
+used after filter    = 37
+rejected by class    = 73
+```
+
+Oznacza to odrzucenie około 66,4% detekcji przed selekcją ROI.
+
+Po dalszej deduplikacji i ograniczeniu liczby regionów w tym samym przebiegu
+wybrano łącznie 25 ROI.
+
+Wniosek:
+
+Filtr klas nie skraca samej inferencji MP, ponieważ działa po otrzymaniu
+tensora wynikowego. Może jednak ograniczyć koszt dalszej części kaskady,
+ponieważ zmniejsza liczbę kandydatów konkurujących o miejsca w budżecie ROI
+oraz ryzyko wykonywania MT dla obiektów niebędących pojazdami.
+
+### Rozwiązanie — jawna polityka budżetu ROI
+
+Wprowadzono `RoiBudgetPolicy` i trzy pierwsze warianty badawcze:
+
+```text
+R0 / FULL_FRAME
+  MP pomijany
+  MT analizuje pełną klatkę
+
+R1 / ONE_ROI
+  MP aktywny
+  maksymalnie 1 ROI przekazywany do MT
+
+R2 / TWO_ROI
+  MP aktywny
+  maksymalnie 2 ROI przekazywane do MT
+```
+
+Budżet ROI przestał być wyłącznie stałą wewnątrz `MobileAlprEngine`.
+
+Wariant R0 pełni rolę punktu odniesienia dla eksperymentu. R1 i R2 pozwalają
+ocenić, czy koszt dodatkowego MP i kolejnych uruchomień MT dla ROI zostaje
+zrekompensowany przez ograniczenie analizowanego obszaru i zwiększenie
+względnej skali tablicy.
+
+### Rozwiązanie — oddzielenie konfiguracji normalnej od eksperymentalnej
+
+Pierwsza implementacja R0/R1/R2 zapisywała jednocześnie:
+
+```text
+vehicle_cascade_enabled
+```
+
+co powodowało, że wybór wariantu eksperymentalnego modyfikował normalną
+konfigurację aplikacji.
+
+Zmieniono architekturę na dwie niezależne warstwy:
+
+```text
+NormalConfig
+    +
+Experiment override
+    ↓
+EffectiveConfig
+```
+
+Normalna konfiguracja użytkownika przechowuje rzeczywisty stan kaskady MP.
+Tryb eksperymentalny jest warstwą nadrzędną i nie zmienia tej wartości.
+
+Przykład:
+
+```text
+normalnie:
+MP = WŁ.
+
+EXP + R0:
+MP efektywnie pomijany
+
+EXP OFF:
+MP ponownie WŁ.
+```
+
+Analogicznie normalne `MP = WYŁ.` może zostać chwilowo nadpisane przez R1 lub
+R2, a po wyłączeniu eksperymentu aplikacja wraca do wcześniejszego stanu.
+
+W Opcjach dodano nadrzędny przełącznik trybu eksperymentalnego. W czasie jego
+działania graf MP→MT→MZ pokazuje stan efektywnie wykonywany przez pipeline,
+ale normalna konfiguracja MP nie jest edytowana.
+
+Decyzja:
+
+Eksperyment nie jest edytorem normalnej konfiguracji aplikacji. Jest
+tymczasową warstwą nadpisującą wyłącznie parametry potrzebne do konkretnego
+badania.
+
+### Rozwiązanie — raportowanie konfiguracji normalnej, eksperymentalnej i efektywnej
+
+Raport `.alprsession` rozróżnia obecnie:
+
+```text
+normal_configuration
+experiment
+roi_budget_policy
+```
+
+Przykładowa konfiguracja testu R0:
+
+```json
+{
+  "normal_configuration": {
+    "vehicle_cascade_enabled": true
+  },
+  "experiment": {
+    "enabled": true,
+    "type": "roi_budget",
+    "roi_budget_policy": "r0_full_frame",
+    "effective_roi_budget_policy": "r0_full_frame"
+  }
+}
+```
+
+Pozwala to odtworzyć zarówno normalne ustawienia aplikacji, jak i warstwę
+użytą tylko podczas konkretnego eksperymentu.
+
+### Weryfikacja R0 na pełnym eksporcie `.alprsession`
+
+Wykonano kontrolny przebieg R0 na fizycznym urządzeniu.
+
+Raport potwierdził:
+
+```text
+normal_configuration.vehicle_cascade_enabled = true
+experiment.enabled                           = true
+experiment.roi_budget_policy                 = r0_full_frame
+experiment.effective_roi_budget_policy       = r0_full_frame
+```
+
+Dane wykonawcze:
+
+```text
+processed_frames         = 51
+plate_roi_runs           = 0
+plate_full_frame_runs    = 51
+full_frame_fallbacks     = 0
+dropped_frames           = 52
+```
+
+W `traces.csv` nie było żadnego czasu:
+
+```text
+vehicle_preprocess
+vehicle_inference
+vehicle_postprocess
+```
+
+co potwierdza, że MP nie został jedynie ukryty w UI, lecz rzeczywiście nie był
+wykonywany.
+
+Dla tego przebiegu uzyskano pomocniczy baseline wydajności:
+
+```text
+MT p50       ≈ 2978 ms
+MT p90       ≈ 2997 ms
+MT p95       ≈ 3006 ms
+
+pipeline p50 ≈ 3530 ms
+pipeline p90 ≈ 3602 ms
+pipeline p95 ≈ 4278 ms
+```
+
+Wyniki te są punktem kontrolnym, a nie jeszcze wynikiem formalnego porównania.
+Właściwy eksperyment wymaga identycznego materiału, kilku powtórzeń i
+porównania R0, R1 oraz R2.
+
+Podczas analizy raportu zauważono również, że statystyki MZ zawierają wpisy
+zerowe dla klatek, w których MZ nie został rzeczywiście uruchomiony. Przed
+końcową analizą wydajności MZ należy rozdzielić brak wykonania od czasu
+inferencji równego zero.
+
+### Rozwiązanie — ręczny Start/Stop analizy
+
+Automatyczne uruchamianie CameraX przy starcie `MainActivity` zostało usunięte.
+
+Ekran główny ma obecnie jawny stan:
+
+```text
+analiza zatrzymana
+        ↓
+[Uruchom analizę]
+        ↓
+kamera + pipeline
+        ↓
+[Zatrzymaj analizę]
+        ↓
+analiza zatrzymana
+```
+
+Przycisk `Start/Stop` kolektora cropów zachował osobną odpowiedzialność i nie
+steruje inferencją.
+
+Po zatrzymaniu analizy:
+
+- CameraX jest odpinany przez `CameraController.stop()`;
+- `cameraStarted=false`;
+- zatrzymywany jest monitor ruchu;
+- resetowany jest tracking pipeline;
+- resetowany jest `CameraMotionOverlayTracker`;
+- czyszczony jest bieżący overlay;
+- `PreviewView` jest ukrywany, aby nie pozostawiać ostatniej klatki jako
+  pozornie aktywnego obrazu;
+- historia już zebranych cropów pozostaje zachowana.
+
+Przy kolejnym uruchomieniu analiza startuje bez stanu trackingu z poprzedniego
+przebiegu.
+
+Decyzja:
+
+Użytkownik musi jednoznacznie określać moment, w którym aplikacja zaczyna
+obciążać urządzenie i przetwarzać klatki. Jest to istotne zarówno dla zwykłego
+użycia, jak i dla powtarzalności eksperymentów.
+
+### Rozwiązanie — sesja pomiarowa niezależna od czasu życia aplikacji
+
+`MetricsCollector` wcześniej rozpoczynał pomiar w chwili utworzenia obiektu.
+W konsekwencji raport obejmował również czas przygotowania ustawień i
+stanowiska przed faktycznym uruchomieniem kamery.
+
+Dodano jawne metody:
+
+```text
+startMeasurementSession()
+finishMeasurementSession()
+```
+
+Rozpoczęcie analizy:
+
+- czyści wcześniejsze trace'y pomiarowe;
+- zeruje dropped frames;
+- zeruje czasy pierwszego wyniku;
+- zapisuje nowe `sessionStartedMillis` i `sessionStartedNanos`;
+- aktywuje przyjmowanie trace'ów.
+
+Zatrzymanie analizy:
+
+- zapisuje `sessionFinishedMillis`;
+- blokuje przyjmowanie kolejnych trace'ów;
+- zachowuje dane zakończonego przebiegu do eksportu.
+
+`add()`, `frameDropped()` i `recordRecognitionState()` respektują stan aktywnej
+sesji pomiarowej.
+
+Raport otrzymał:
+
+```text
+session_started_ms
+session_finished_ms
+session_duration_ms
+measurement_session_active
+```
+
+Weryfikacja na fizycznym urządzeniu:
+
+```text
+session_duration_ms = 41718
+measurement_session_active = false
+```
+
+Log aplikacji wskazywał uruchomienie i zatrzymanie analizy w tym samym
+przedziale. Różnica pomiędzy czasem raportu a wpisem końcowym logu wynika z
+tego, że sesja pomiarowa jest kończona przed sprzątaniem UI i odpinaniem
+CameraX.
+
+Wniosek:
+
+Czas benchmarku jest obecnie związany z rzeczywistym przebiegiem analizy, a nie
+z czasem, przez jaki użytkownik miał otwartą aplikację.
+
+### Kierunek architektury eksperymentów
+
+Ustalono rozdzielenie czterech pojęć:
+
+```text
+NormalConfig
+ExperimentConfig
+ExperimentSession
+MetricsCollector
+```
+
+Znaczenie:
+
+- `NormalConfig` — normalne ustawienia użytkownika;
+- `ExperimentConfig` — określa co jest badane, np. wariant R0/R1/R2;
+- `ExperimentSession` — ma reprezentować jeden konkretny przebieg od startu
+  do zakończenia;
+- `MetricsCollector` — zbiera dane pomiarowe z aktywnego przebiegu.
+
+Planowany minimalny `ExperimentSession` ma przechowywać:
+
+```text
+session_id
+state: IDLE / RUNNING / FINISHED
+start
+stop
+duration
+completion_reason
+```
+
+Rozważane powody zakończenia:
+
+```text
+MANUAL
+TIMER
+ERROR
+```
+
+`ExperimentSession` nie został jeszcze wdrożony.
+
+### Opcjonalny TimerConfig
+
+Timer został uznany za opcjonalny element konfiguracji eksperymentu, a nie za
+cechę obowiązkową każdego eksperymentu.
+
+Docelowo:
+
+```text
+ExperimentConfig
+  ├── wariant badawczy
+  ├── TimerConfig?       opcjonalny
+  └── przyszłe warunki
+```
+
+Bez timera sesja trwa do ręcznego zatrzymania.
+
+Z timerem:
+
+```text
+start
+  ↓
+odliczanie
+  ↓
+osiągnięcie limitu
+  ↓
+ExperimentSession.finish(TIMER)
+```
+
+Rzeczywisty czas sesji ma być mierzony zawsze, niezależnie od tego, czy timer
+ograniczający przebieg został włączony.
+
+Timer i `ExperimentSession` są na tym etapie projektem architektonicznym, a nie
+funkcją ukończoną.
+
+### Znaczenie dla pracy inżynierskiej
+
+Zmiany z 2026-08-23 bezpośrednio wspierają dwa fragmenty pracy.
+
+**Rozdział implementacyjny klienta mobilnego:**
+
+- jawne sterowanie CameraX i momentem rozpoczęcia analizy;
+- oddzielenie normalnej konfiguracji od eksperymentalnych override'ów;
+- jawna polityka budżetu ROI;
+- raportowanie efektywnej konfiguracji;
+- powiązanie pomiaru z rzeczywistą sesją analizy.
+
+**Rozdział dotyczący analizy wyników:**
+
+- wariant referencyjny R0;
+- wariant R1 z jednym ROI;
+- wariant R2 z maksymalnie dwoma ROI;
+- liczniki liczby detekcji MP, wybranych ROI, fallbacków i uruchomień MT;
+- p50, p90, p95 i p99 dla etapów i całego pipeline'u;
+- możliwość wykonania kilku powtarzalnych przebiegów o jednoznacznie
+  określonym początku i końcu.
+
+Najważniejsze pytanie badawcze:
+
+> Czy koszt dodatkowego modelu pojazdów MP i kolejnych wywołań MT dla ROI
+> zostaje zrekompensowany przez analizę ograniczonego obszaru obrazu, a jeżeli
+> tak, jaki budżet ROI daje najlepszy kompromis pomiędzy wydajnością i
+> skutecznością końcowego ALPR?
+
+### Decyzje z sesji 2026-08-23
+
+- MP filtruje klasy niebędące pojazdami przed wyborem ROI;
+- filtr klas nie jest traktowany jako skrócenie czasu inferencji samego MP;
+- liczba ROI jest jawnym parametrem eksperymentalnym;
+- R0/R1/R2 nie mogą modyfikować normalnej konfiguracji użytkownika;
+- tryb eksperymentalny jest warstwą override nad konfiguracją normalną;
+- graf UI ma prezentować konfigurację efektywnie wykonywaną;
+- raport musi zachować jednocześnie normalny stan i konfigurację
+  eksperymentalną;
+- kamera nie uruchamia się automatycznie;
+- użytkownik jawnie wyznacza moment rozpoczęcia i zakończenia analizy;
+- pomiar nie obejmuje czasu przygotowania stanowiska;
+- historia cropów jest niezależna od bieżącej sesji analizy;
+- timer jest opcjonalnym warunkiem zakończenia przyszłej
+  `ExperimentSession`, a nie obowiązkową częścią eksperymentu.
+
+### Weryfikacja
+
+- filtr klas MP sprawdzono na rzeczywistych logach;
+- potwierdzono dozwolone klasy COCO `[2,3,5,7]`;
+- w analizowanym przebiegu odrzucono 73 z 110 surowych detekcji MP;
+- tryb eksperymentalny sprawdzono ręcznie dla powrotu do normalnego stanu MP;
+- graf poprawnie pokazuje efektywny stan MP w R0;
+- R0 zweryfikowano przez pełny `.alprsession`;
+- w R0 potwierdzono 51 uruchomień MT full-frame i 0 uruchomień MT na ROI;
+- w R0 nie zarejestrowano żadnej inferencji MP;
+- ręczny Start/Stop analizy sprawdzono na urządzeniu;
+- po STOP ostatni obraz kamery jest usuwany z podglądu;
+- nowy pomiar jest rozpoczynany dopiero przy `Uruchom analizę`;
+- kontrolny raport potwierdził sesję pomiarową około 41,7 s;
+- kod po zmianach został zbudowany, uruchomiony na fizycznym urządzeniu oraz
+  zapisany w repozytorium Git.
+
+### Pozostało
+
+- wdrożyć minimalny `ExperimentSession`;
+- dodać opcjonalny `TimerConfig`;
+- określić UI timera bez uzależniania wszystkich eksperymentów od czasu;
+- wykonać kontrolne przebiegi R1 i R2;
+- zweryfikować, że `vehicle_regions_selected` nigdy nie przekracza odpowiednio
+  1 dla R1 i 2 dla R2;
+- wykonać właściwą serię porównawczą R0/R1/R2 na identycznym materiale;
+- wykonać kilka powtórzeń każdego wariantu;
+- rozdzielić rzeczywiste wywołania MZ od zerowych wpisów czasowych dla klatek,
+  w których MZ został pominięty;
+- zamrozić końcowy protokół camera-in-the-loop;
+- zdefiniować sposób zakończenia pojedynczej sceny w testach skuteczności;
+- po zakończeniu warstwy eksperymentalnej ponownie uruchomić pełny zestaw
+  regresyjny.
+
+---
+
+
 # 6. Najważniejsze decyzje projektowe
 
 ## Pakiet zamiast surowych wag
@@ -1392,11 +1880,30 @@ udowadniania poprawności odczytu.
 Zmiana sceny czyści stan czasowy inferencji i overlayu, ale nie usuwa cropów
 zebranych wcześniej.
 
+
+## Eksperyment jest warstwą nad konfiguracją normalną
+
+Konfiguracja eksperymentalna nie może trwale modyfikować normalnych ustawień
+użytkownika. `ExperimentConfig` tworzy efektywną konfigurację tylko na czas
+badania, a po jego wyłączeniu system wraca do stanu normalnego.
+
+## Sesja pomiarowa jest krótsza niż życie aplikacji
+
+Czas raportowany jako czas przebiegu nie rozpoczyna się przy utworzeniu
+`MainActivity` ani `MetricsCollector`. Sesja pomiarowa rozpoczyna się jawnie
+wraz z uruchomieniem analizy i kończy przed sprzątaniem CameraX oraz UI.
+
+## Timer eksperymentalny jest opcjonalny
+
+Ograniczenie czasowe ma być dodatkowym warunkiem zakończenia eksperymentu, a
+nie częścią obowiązkową wszystkich przebiegów. Eksperyment bez timera kończy
+się ręcznie.
+
 ---
 
 # 7. Weryfikacja
 
-Stan na 2026-08-22:
+Stan na 2026-08-23:
 
 | Kontrola | Wynik |
 | --- | --- |
@@ -1413,6 +1920,15 @@ Stan na 2026-08-22:
 | Reset pojedynczej starej ramki UI | wymaga końcowego testu wizualnego |
 | Badge numeru przy aktywnym MP | problem zdiagnozowany, finalna weryfikacja otwarta |
 | Ulepszona obsługa tablic dwurzędowych | analiza zakończona, implementacja otwarta |
+| Filtr klas MP | potwierdzony na rzeczywistych logach; COCO `[2,3,5,7]` |
+| Polityka R0/R1/R2 | implementacja gotowa; R0 potwierdzone w `.alprsession` |
+| Rozdzielenie normalnej konfiguracji i EXP | potwierdzone ręcznie |
+| R0: MP pominięty | potwierdzone: 0 inferencji MP, 51 MT full-frame |
+| Ręczny Start/Stop analizy | potwierdzony na urządzeniu |
+| Czyszczenie podglądu po STOP | potwierdzone |
+| Pomiar tylko w aktywnej sesji analizy | potwierdzony; przebieg kontrolny 41,718 s |
+| `ExperimentSession` | zaprojektowany, jeszcze niewdrożony |
+| Opcjonalny `TimerConfig` | zaprojektowany, jeszcze niewdrożony |
 | Parser raportu desktopowego | raport przyjęty |
 | Bramka jakości bez ground truth | poprawnie odrzucona |
 
@@ -1422,8 +1938,8 @@ Aktualny artefakt debug:
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Po zakończeniu zmian dotyczących badge'ów, filtra klas MP i kolejności znaków
-należy ponownie uruchomić pełny zestaw regresyjny.
+Po zakończeniu zmian dotyczących badge'ów, kolejności znaków i warstwy
+eksperymentalnej należy ponownie uruchomić pełny zestaw regresyjny.
 
 ---
 
@@ -1471,6 +1987,8 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 ## Protokół wydajności
 
 - cold start raportować osobno;
+- początek i koniec właściwego pomiaru wiązać z jawną sesją analizy;
+- przygotowanie stanowiska przed naciśnięciem `Uruchom analizę` nie należy do czasu benchmarku;
 - steady state mierzyć zegarem monotonicznym;
 - raportować co najmniej p50, p90, p95 i p99;
 - wykonywać kilka powtórzeń;
@@ -1513,10 +2031,15 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 - przenieść `reading_order.py` do Androida;
 - poprawić postprocessing układów wielorzędowych;
 - dodać testy regresji tablic jedno- i dwurzędowych;
-- ograniczyć MP do klas pojazdów;
-- wykonać A/B:
-  - MT pełna klatka;
-  - MP→ROI→MT;
+- wdrożyć minimalny `ExperimentSession` z ID, stanem, czasem i powodem zakończenia;
+- dodać opcjonalny `TimerConfig` jako warunek zakończenia sesji;
+- wykonać kontrolne przebiegi R1 i R2;
+- wykonać pełne A/B/C strategii ROI:
+  - R0 — MT pełna klatka;
+  - R1 — MP→maks. 1 ROI→MT;
+  - R2 — MP→maks. 2 ROI→MT;
+- wykonać kilka powtórzeń każdego wariantu na identycznym materiale;
+- poprawić statystyki MZ tak, aby pominięcie MZ nie było raportowane jako czas `0 ms`;
 - porównać runtime'y NCNN, ONNX i TFLite;
 - zamrozić protokół camera-in-the-loop;
 - wykonać pełny benchmark z ground truth;
@@ -1599,4 +2122,3 @@ powinny natomiast reprezentować aktualny stan projektu.
   eksportowych i kwantyzacji;
 - `docs/podbudowa_literaturowa_metodyki_testow_alpr.md` — podbudowa
   literaturowa metodologii pomiarów.
-
