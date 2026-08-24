@@ -2060,6 +2060,105 @@ Decyzje badawcze:
   porównujący lżejszy MT, mniejszy rozmiar wejścia, inne runtime'y i liczbę
   wątków.
 
+### Rozwiązanie — temporalny konsensus struktury wierszy znaków
+
+Po rozszerzeniu `ReadingOrderResolver` o bardziej odporną rekonstrukcję
+wierszy rozszerzono również `TemporalCharacterAggregator`, ponieważ sama
+całkowita liczba znaków nie wystarcza do jednoznacznego opisu obserwacji.
+Przykładowo ciąg o ośmiu znakach może pochodzić zarówno z tablicy
+jednorzędowej `[8]`, jak i dwurzędowej `[3,5]` albo `[4,4]`.
+
+W nowej wersji stan konsensusu jest rozdzielany według struktury przestrzennej
+sekwencji. Dla każdej obserwacji MZ:
+
+- znaki są najpierw grupowane w wiersze przez `ReadingOrderResolver`;
+- dla każdego wiersza zapisywana jest liczba znaków;
+- powstaje sygnatura struktury, np. `single_row [7]` albo `two_row [3,5]`;
+- obserwacje o tej samej całkowitej długości, ale innej strukturze wierszy,
+  trafiają do osobnych stanów konsensusu;
+- dominujący stan jest wybierany na podstawie liczby zgodnych obserwacji, a
+  przy remisie na podstawie sumarycznego confidence sekwencji;
+- po co najmniej dwóch zgodnych obserwacjach struktura może zostać uznana za
+  oczekiwaną dla danego tracku.
+
+Przykład:
+
+```text
+klatka 1: [3,5]
+klatka 2: [3,5]
+
+=> expectedLayout    = two_row
+=> expectedRowCounts = [3,5]
+=> expectedCount     = 8
+```
+
+Dzięki temu dwa wyniki o tej samej liczbie znaków nie są już traktowane jako
+równoważne wyłącznie na podstawie długości:
+
+```text
+stary mechanizm:
+[8]   == [3,5]        # oba warianty mają 8 znaków
+
+nowy mechanizm:
+[8]   != [3,5]        # różna struktura przestrzenna
+```
+
+Istotnym założeniem jest to, że struktura czasowa nie stanowi ground truth.
+Program nie „wie” z góry, ile wierszy ma tablica. Wnioskuje o dominującym
+układzie z kolejnych obserwacji tego samego tracku. Z tego powodu
+`expectedRowCounts` powinno być wykorzystywane jako kryterium preferencji lub
+rankingu kandydatów, a nie jako bezwzględny filtr odrzucający każdy wynik o
+innej strukturze. Kilka kolejnych błędnych obserwacji mogłoby bowiem utrwalić
+błędny układ.
+
+Weryfikacja:
+
+- testy `ReadingOrderResolver` potwierdzają zachowanie pojedynczego wiersza przy
+  jitterze współrzędnych Y oraz poprawną kolejność dwóch wierszy o różnych
+  wysokościach znaków;
+- testy `CharacterSequencePostProcessor` potwierdzają, że płaski
+  `expectedCount` nadal ogranicza kandydatów dla tablic jednorzędowych, ale nie
+  spłaszcza poprawnie rozpoznanej struktury dwurzędowej;
+- testy `TemporalCharacterAggregator` potwierdzają, że `[4]` i `[2,2]` są
+  przechowywane jako osobne stany mimo tej samej całkowitej długości oraz że po
+  dwóch zgodnych obserwacjach udostępniane są `expectedLayout` i
+  `expectedRowCounts`;
+- `gradlew testDebugUnitTest` zakończył się powodzeniem po wprowadzeniu zmian.
+
+Stan integracji:
+
+- struktura wierszy jest już rozpoznawana i przechowywana w konsensusie
+  temporalnym;
+- kolejnym krokiem jest przekazanie `expectedLayout` i `expectedRowCounts`
+  przez `PlateTrackCoordinator.Decision` do wyboru kandydatów MZ;
+- do czasu wykonania tego kroku struktura jest dostępna w stanie tracku, ale
+  nie wpływa jeszcze na ranking normalnego wyniku i ścieżki recall.
+
+#### Gotowiec do pracy — konsensus czasowy struktury tablicy
+
+> W celu zwiększenia stabilności rozpoznawania zastosowano konsensus czasowy
+> dla kolejnych obserwacji tej samej tablicy. Po każdej inferencji MZ znaki są
+> grupowane w wiersze na podstawie ich położenia geometrycznego, co pozwala
+> opisać strukturę odczytu nie tylko przez liczbę znaków, lecz także przez
+> liczbę wierszy i liczbę znaków w każdym z nich, np. `[7]` dla tablicy
+> jednorzędowej lub `[3,5]` dla tablicy dwurzędowej. Dla każdego tracku
+> przechowywane są osobne stany konsensusu dla różnych struktur. Po uzyskaniu
+> co najmniej dwóch zgodnych obserwacji dominująca struktura może być
+> wykorzystana jako informacja pomocnicza przy ocenie kolejnych wyników MZ.
+
+> Informacja o oczekiwanej strukturze nie jest traktowana jako reguła
+> bezwzględna ani jako ground truth. Służy jedynie do preferowania wyników
+> zgodnych z dominującą historią danego tracku. Dzięki temu chwilowa detekcja,
+> w której znaki dwóch wierszy zostaną błędnie potraktowane jako jeden ciąg,
+> może otrzymać niższy priorytet niż alternatywny wynik zachowujący wcześniej
+> obserwowany układ wierszy.
+
+> Ograniczeniem mechanizmu jest możliwość utrwalenia błędnej struktury, jeżeli
+> kilka kolejnych obserwacji zostanie błędnie zinterpretowanych w ten sam
+> sposób. Z tego względu informacja temporalna powinna pełnić rolę kryterium
+> rankingowego, a nie twardego filtra odrzucającego wyniki o odmiennej liczbie
+> wierszy.
+
 ### Gotowce do pracy inżynierskiej
 
 #### Opis implementacyjny — stały rozmiar wejścia MT i znaczenie ROI
