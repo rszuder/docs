@@ -2060,6 +2060,74 @@ Decyzje badawcze:
   porównujący lżejszy MT, mniejszy rozmiar wejścia, inne runtime'y i liczbę
   wątków.
 
+### Interpretacja `dropped frames` i czasowego próbkowania sceny
+
+W trakcie analizy wyników doprecyzowano znaczenie licznika `dropped_frames`.
+Nie jest on bezpośrednią miarą stabilności obrazu ani czasu, przez jaki tablica
+pozostawała dobrze widoczna. Jest natomiast wskaźnikiem niedopasowania
+wydajności pipeline'u do szybkości strumienia wideo.
+
+W konfiguracji CameraX wykorzystującej strategię `KEEP_ONLY_LATEST` kolejne
+klatki mogą być generowane przez kamerę szybciej, niż pipeline jest w stanie je
+przetwarzać. W takim przypadku starsze klatki są pomijane, a po zakończeniu
+analizy bieżącej klatki aplikacja pobiera najnowszą dostępną obserwację. Wysoka
+wartość `dropped_frames` oznacza więc, że system rzadko próbkuje scenę, mimo że
+kamera fizycznie zarejestrowała w tym czasie więcej obrazów.
+
+Zależność interpretacyjna jest następująca:
+
+```text
+większa liczba dropped frames
+        ↓
+rzadsze efektywne próbkowanie sceny
+        ↓
+większy odstęp czasowy między analizowanymi klatkami
+        ↓
+większe ryzyko pominięcia krótkiego okresu dobrej widoczności tablicy
+```
+
+Z tego powodu `dropped_frames` należy interpretować łącznie z czasem
+przetwarzania pipeline'u oraz efektywną częstotliwością przetwarzania klatek.
+Jeżeli mediana czasu pipeline'u wynosi około `4,63 s`, to teoretyczna
+częstotliwość przetwarzania wynosi około `0,22 kl./s`. Oznacza to, że między
+dwiema analizowanymi klatkami może minąć kilka sekund, mimo że kamera w tym
+czasie wygenerowała wiele obrazów.
+
+W praktyce jest to istotne dla ALPR w ruchu. Jeżeli tablica znajduje się w
+korzystnym położeniu — jest ostra, czytelna i geometrycznie stabilna — tylko
+przez krótki przedział czasu krótszy niż typowy odstęp między analizowanymi
+klatkami, pipeline może nie otrzymać żadnej próbki reprezentującej ten moment.
+Nie oznacza to błędu kamery ani detektora, lecz ograniczenie czasowej zdolności
+systemu do próbkowania strumienia.
+
+Wniosek badawczy:
+
+- `dropped_frames` nie powinno być nazywane miarą stabilności obrazu;
+- jest to pośrednia miara ograniczonej zdolności pipeline'u do czasowego
+  próbkowania strumienia wideo;
+- do analizy wyników live warto raportować również efektywną częstotliwość
+  przetwarzania (`processed_fps`) albo typowy odstęp czasu między kolejnymi
+  przetworzonymi klatkami (`processed_frame_interval_ms`);
+- miary te pozwalają lepiej ocenić, czy system ma realną szansę uchwycić
+  krótkotrwały okres stabilnego obrazu tablicy.
+
+#### Gotowiec do pracy — dropped frames i stabilne okno obserwacji
+
+> Liczba pominiętych klatek (`dropped frames`) nie stanowi bezpośredniej miary
+> stabilności obrazu. Jest natomiast wskaźnikiem niedopasowania wydajności
+> pipeline’u do szybkości strumienia wideo. Wzrost liczby pominiętych klatek
+> oznacza rzadsze próbkowanie sceny przez system, a tym samym zwiększa
+> prawdopodobieństwo pominięcia krótkiego przedziału czasu, w którym tablica
+> rejestracyjna jest dobrze widoczna, ostra i geometrycznie stabilna. Z tego
+> względu metrykę `dropped frames` należy interpretować łącznie z efektywną
+> częstotliwością przetwarzania klatek lub średnim odstępem czasowym między
+> kolejnymi analizowanymi klatkami.
+
+> Jeżeli czas stabilnej obserwacji tablicy jest krótszy niż typowy odstęp
+> między kolejnymi przetwarzanymi klatkami, system może nie zarejestrować
+> żadnej próbki reprezentującej ten korzystny moment, nawet jeśli kamera
+> fizycznie wygenerowała w tym czasie wiele klatek.
+
 ### Rozwiązanie — temporalny konsensus struktury wierszy znaków
 
 Po rozszerzeniu `ReadingOrderResolver` o bardziej odporną rekonstrukcję
