@@ -65,7 +65,7 @@ na urządzeniu.
 
 ## 3. Stos technologiczny
 
-Stan na 2026-08-23:
+Stan na 2026-08-24:
 
 | Obszar | Rozwiązanie |
 | --- | --- |
@@ -1819,6 +1819,7 @@ Najważniejsze pytanie badawcze:
 - wdrożyć minimalny `ExperimentSession`;
 - dodać opcjonalny `TimerConfig`;
 - określić UI timera bez uzależniania wszystkich eksperymentów od czasu;
+- zablokować lub oznaczać zmianę kluczowej konfiguracji eksperymentu w aktywnej `ExperimentSession`;
 - wykonać kontrolne przebiegi R1 i R2;
 - zweryfikować, że `vehicle_regions_selected` nigdy nie przekracza odpowiednio
   1 dla R1 i 2 dla R2;
@@ -1833,6 +1834,277 @@ Najważniejsze pytanie badawcze:
 
 ---
 
+
+## 2026-08-24 — domknięcie warstwy pomiarowej, dynamiczna rozdzielczość kamery, uproszczenie UI i walidacja wydajności
+
+### Problem
+
+Po wdrożeniu wariantów R0/R1/R2 i ręcznie sterowanej sesji analizy pozostały
+cztery obszary, które mogły zniekształcić późniejsze eksperymenty albo utrudnić
+ich obsługę:
+
+- brakowało trwałego obiektu reprezentującego pojedynczy przebieg eksperymentu;
+- timer był projektowany jako element ustawień, mimo że faktycznie jest
+  parametrem pojedynczego uruchomienia eksperymentu;
+- ustawienia kamery posługiwały się presetami, które nie gwarantowały zgodności
+  deklarowanej i rzeczywistej rozdzielczości `ImageAnalysis`;
+- raport MZ uwzględniał wartości `0 ms` również wtedy, gdy MZ nie wykonano,
+  przez co percentyle czasu inferencji były zaniżane;
+- główny ekran stopniowo urósł do panelu technicznego z osobnymi przyciskami
+  Start/Stop, rozwijaniem i maksymalizacją galerii oraz ręcznie sterowanymi
+  wysokościami kontenerów.
+
+### Rozwiązanie — `ExperimentSession` i timer pojedynczego przebiegu
+
+Wdrożono `ExperimentSession` jako niezależny od CameraX obiekt cyklu życia
+jednego eksperymentu. Sesja przechowuje:
+
+- unikalne `session_id`;
+- stan `IDLE`, `RUNNING` albo `FINISHED`;
+- typ eksperymentu i wariant, np. `roi_budget / r0_full_frame`;
+- czas początku i końca;
+- czas trwania liczony zegarem monotonicznym;
+- powód zakończenia `manual`, `timer` albo `error`;
+- zamrożoną konfigurację opcjonalnego timera.
+
+`ExperimentSession` rozpoczyna się razem z pomiarem po naciśnięciu
+`Uruchom analizę`, natomiast techniczny restart CameraX, np. po zmianie
+rozdzielczości, nie tworzy nowej sesji i nie zeruje timera. Eksport pobiera
+niemutowalny snapshot zakończonej sesji, dzięki czemu późniejsza zmiana ustawień
+UI nie zmienia opisu już wykonanego przebiegu.
+
+Timer przeniesiono z ekranu Opcje na ekran główny. Jest ustawieniem pojedynczego
+przebiegu: użytkownik może uzbroić timer przed START, po czym wybrana wartość
+zostaje zamrożona w `ExperimentSession`. Po zakończeniu sesji timer jest
+rozbrajany; kolejne uruchomienie jest bez limitu czasu, dopóki użytkownik nie
+uzbroi timera ponownie.
+
+Weryfikacja:
+
+- dwa kolejne START/STOP tworzą różne `session_id`;
+- zmiana rozdzielczości podczas aktywnej analizy restartuje CameraX bez
+  utworzenia nowej `ExperimentSession`;
+- eksport po restarcie zawiera trace'y sprzed i po restarcie w tej samej sesji;
+- odmowa uprawnienia kamery nie tworzy pustej sesji eksperymentalnej;
+- timer 15 s automatycznie zakończył sesję z `completion_reason = timer`;
+- timer 60 s pozostał liczony od pierwotnego START mimo restartu CameraX po
+  około 16 s; log potwierdził zakończenie po około `60005 ms`, a nie 60 s po
+  restarcie;
+- snapshot `ExperimentSession` trafia do `report.json` razem z typem, wariantem,
+  czasem trwania, powodem zakończenia i konfiguracją timera.
+
+### Rozwiązanie — rzeczywiste rozdzielczości aparatu zamiast sztywnych presetów
+
+Zrezygnowano z traktowania `FAST/AUTO/DISTANT` jako zamkniętej listy rozmiarów.
+Dodano katalog rozdzielczości tylnej kamery odczytywany z Camera2 dla formatu
+`YUV_420_888`. Ekran Opcje prezentuje użytkownikowi rzeczywiste rozdzielczości
+zgłaszane przez urządzenie, wraz z proporcjami obrazu i liczbą megapikseli.
+
+Obsługiwane są:
+
+- tryb `Auto`, w którym aplikacja wybiera rozsądny format standardowy;
+- jawny wybór konkretnego `width × height`;
+- standardowa pula formatów Camera2;
+- rozszerzona pula high-resolution, jeżeli urządzenie ją udostępnia.
+
+Raport rozróżnia obecnie:
+
+- `selection_mode` — `auto` albo `explicit`;
+- `selected_resolution` — wybór użytkownika;
+- `requested_width/height` — rozmiar zażądany przez aplikację;
+- `actual_width/height` i `actual_resolution` — rozmiar rzeczywiście otrzymany
+  z CameraX;
+- `requested_resolution_matched` — jawna zgodność żądania z klatką;
+- `extended_high_resolution_mode_requested` — informację, czy użyto specjalnej
+  puli high-resolution Camera2.
+
+Starsze pola `profile` i `high_resolution_mode_requested` pozostawiono jako
+aliasy kompatybilności raportu v1.
+
+Weryfikacja na Samsungu SM-A125F:
+
+- katalog kamery wykrył formaty aż do `4000×3000`, czyli 12 MP;
+- wybranie `4000×3000` dało `requested = actual = 4000×3000` i
+  `requested_resolution_matched = true`;
+- wszystkie trace'y tej sesji potwierdziły źródło `4000×3000`;
+- `extended_high_resolution_mode_requested = false`, co oznacza, że na tym
+  urządzeniu 12 MP należy do zwykłej puli YUV, mimo że jest wysoką
+  rozdzielczością w potocznym znaczeniu;
+- osobny test `640×480` również potwierdził pełną zgodność
+  `requested = actual = 640×480`.
+
+Wniosek metodologiczny:
+
+Rozdzielczość źródła może być od tej chwili traktowana jako kontrolowana
+zmienna eksperymentalna. Do porównań należy wykorzystywać rzeczywiste
+`actual_width/height`, a nie samą etykietę ustawienia.
+
+### Rozwiązanie — uproszczenie ekranu głównego i galerii
+
+Ekran główny uproszczono tak, aby kamera i sterowanie przebiegiem były
+najważniejszymi elementami interfejsu:
+
+- osobne przyciski START i STOP zastąpiono jednym CTA zmieniającym funkcję;
+- główny panel nie zawiera już osadzonej galerii ani mechanizmu
+  `ukryta → rozwinięta → zmaksymalizowana`;
+- usunięto ręczne wyliczanie wysokości panelu i kontenera RecyclerView;
+- na ekranie głównym pozostaje prosty stan kolektora cropów i przycisk
+  `Cropy · N`;
+- galeria została przeniesiona do przeciąganego `BottomSheetDialog`;
+- zaznaczanie wszystkich cropów, zapis wybranych oraz manualna walidacja
+  pozostają w galerii, a nie na ekranie kamery;
+- stan cropów, bitmapy, ground truth i eksport nie zostały zmienione — była to
+  refaktoryzacja prezentacji, nie logiki danych.
+
+Weryfikacja:
+
+- kompilacja po migracji layoutów zakończyła się powodzeniem;
+- nowy `bottom_sheet_gallery.xml` zawiera oddzielny RecyclerView, licznik,
+  status kolekcji, selekcję zbiorczą i zapis;
+- ręczny przegląd na urządzeniu potwierdził poprawne otwieranie i zamykanie
+  Bottom Sheeta, zachowanie cropów oraz jeden przycisk Start/Stop analizy.
+
+### Rozwiązanie — poprawne statystyki MZ
+
+Wcześniej `MobileAlprEngine` bezwarunkowo wpisywał do `InferenceTrace`:
+
+```text
+character_preprocess = 0
+character_inference  = 0
+character_postprocess = 0
+```
+
+również dla klatek, w których MZ nie został uruchomiony. `MetricsCollector`
+traktował takie zera jako prawdziwe obserwacje i uwzględniał je w p50/p90/p95.
+
+Po poprawce czasy `rectification`, `character_preprocess`,
+`character_inference` i `character_postprocess` są zapisywane tylko wtedy,
+gdy w danej klatce wykonano co najmniej jedno uruchomienie MZ. Liczniki
+`mz_runs`, `mz_skipped` i `invalid_plate_geometry` są raportowane niezależnie.
+Brak etapu oznacza teraz „etap nie wystąpił”, a nie „wykonał się w 0 ms”.
+
+Weryfikacja kontrolna przy źródle `640×480`:
+
+- czas sesji: `74483 ms`;
+- przetworzone klatki: 15;
+- dropped frames: 16;
+- statusy: 12 × `no_plate`, 1 × `preliminary`, 2 × `recognized`;
+- `mz_runs = 2`;
+- `character_preprocess.count = 2`;
+- `character_inference.count = 2`;
+- `character_postprocess.count = 2`;
+- klatki bez MZ mają brak czasu MZ, a nie `0 ms`;
+- potwierdzono również klatkę ze statusem `recognized` i `mz_runs = 0`, ponieważ
+  stan rozpoznania może pochodzić z wcześniej zbudowanego konsensusu czasowego.
+
+### Pomiar kontrolny wydajności i identyfikacja wąskiego gardła
+
+Po usunięciu sztucznych zer wykonano kontrolny pomiar pełnego pipeline'u na
+Samsungu SM-A125F przy źródle `640×480`.
+
+| Etap | p50 [ms] | p95 [ms] | liczba próbek |
+| --- | ---: | ---: | ---: |
+| konwersja obrazu CameraX | 23,83 | 29,08 | 15 |
+| MP preprocessing | 557,27 | 561,91 | 14 |
+| MP inference | 375,86 | 416,02 | 14 |
+| MP postprocessing | 187,04 | 188,39 | 14 |
+| MT preprocessing | 517,89 | 531,20 | 15 |
+| MT inference | 2973,36 | 2999,22 | 15 |
+| MT postprocessing | 2,34 | 2,59 | 15 |
+| rektyfikacja | 1,67 | 1,81 | 2 |
+| MZ preprocessing | 256,24 | 256,29 | 2 |
+| MZ inference | 472,33 | 475,09 | 2 |
+| MZ postprocessing | 8,35 | 8,63 | 2 |
+| cały pipeline | 4633,93 | 4949,70 | 15 |
+
+Konfiguracja wykonawcza pomiaru:
+
+- MP: YOLO26n Detect, NCNN FP32, CPU, 4 wątki;
+- MT: YOLO26s Pose, około 10,58 mln parametrów, TFLite INT8, CPU, 2 wątki;
+- MZ: YOLO26n Detect, około 2,52 mln parametrów, TFLite INT8, CPU, 1 wątek;
+- wejście MT pozostaje stałe `640×640` niezależnie od tego, czy źródłem jest
+  pełna klatka, czy ROI.
+
+Wnioski:
+
+- głównym wąskim gardłem bieżącej konfiguracji jest MT; sama inferencja
+  detektora tablic zajmuje około 2,97 s dla mediany i dominuje czas całej
+  klatki;
+- preprocessing MT dodaje około 0,52 s;
+- konwersja źródła `640×480` kosztuje około 24 ms, dlatego w tym pomiarze
+  rozdzielczość kamery nie jest głównym ograniczeniem;
+- pojedyncza inferencja MZ kosztuje około 0,47 s i jest wyraźnie lżejsza od MT;
+- mediana całego pipeline'u `4,63 s` odpowiada teoretycznej przepustowości
+  około `0,22` przetworzonej klatki/s, zatem bieżącej konfiguracji na
+  SM-A125F nie należy określać jako systemu czasu rzeczywistego;
+- ROI nie zmniejsza kosztu pojedynczej inferencji MT, ponieważ każdy wycinek
+  jest ostatecznie skalowany do tego samego wejścia `640×640`;
+- potencjalna korzyść MP→ROI→MT może wynikać z lepszej reprezentacji tablicy na
+  wejściu modelu albo z harmonogramu wykonywania, ale każda dodatkowa analiza
+  ROI oznacza kolejne pełne uruchomienie MT;
+- wariant R2, a szczególnie R2 z pełnoklatkowym fallbackiem, może więc zwiększyć
+  opóźnienie. Jest to hipoteza wymagająca bezpośredniego porównania R0/R1/R2,
+  a nie gotowy wynik końcowy.
+
+Decyzje badawcze:
+
+- bieżący zestaw modeli pozostaje konfiguracją bazową do eksperymentu R0/R1/R2;
+- przed tą serią nie należy zmieniać architektury MT, ponieważ wymieszałoby to
+  wpływ polityki ROI z wpływem modelu;
+- końcowe wartości wydajności wymagają co najmniej trzech powtórzeń każdego
+  wariantu w tych samych warunkach;
+- w eksperymencie ROI należy raportować liczbę faktycznych uruchomień MT,
+  `plate_roi_runs`, `plate_full_frame_runs`, `full_frame_fallbacks` oraz
+  `vehicle_runs`;
+- po zakończeniu serii bazowej można wykonać osobny eksperyment optymalizacyjny
+  porównujący lżejszy MT, mniejszy rozmiar wejścia, inne runtime'y i liczbę
+  wątków.
+
+### Gotowce do pracy inżynierskiej
+
+#### Opis implementacyjny — stały rozmiar wejścia MT i znaczenie ROI
+
+> W zastosowanym rozwiązaniu detekcja tablic wykonywana jest przez model o
+> stałym rozmiarze wejścia 640×640 pikseli. Oznacza to, że zarówno pełna klatka,
+> jak i wycinek ROI przed inferencją są skalowane do identycznego rozmiaru
+> tensora. Ograniczenie analizowanego obszaru do ROI nie zmniejsza zatem kosztu
+> pojedynczego wykonania sieci MT. Potencjalna korzyść kaskady MP→ROI→MT wynika
+> przede wszystkim ze zmiany zawartości obrazu wejściowego oraz możliwości
+> sterowania częstotliwością uruchamiania kolejnych etapów, a nie ze zmniejszenia
+> liczby operacji wykonywanych przez pojedynczą inferencję MT. Z tego powodu
+> liczba ROI została potraktowana jako zmienna eksperymentalna.
+
+#### Wynik kontrolny — identyfikacja głównego kosztu pipeline'u
+
+> Pomiar kontrolny wykonany na urządzeniu Samsung SM-A125F wykazał, że głównym
+> składnikiem opóźnienia badanego pipeline'u jest detektor tablic MT. Przy obrazie
+> źródłowym 640×480 mediana czasu samej inferencji MT wyniosła około 2,97 s,
+> natomiast mediana całego przetwarzania klatki około 4,63 s. Dla porównania
+> konwersja obrazu z CameraX zajmowała około 24 ms, a inferencja modelu znaków
+> MZ około 472 ms. Wynik wskazuje, że w bieżącej konfiguracji
+> sprzętowo-modelowej podstawowym ograniczeniem wydajności nie jest akwizycja
+> obrazu, lecz koszt obliczeniowy MT. Pomiar ma charakter kontrolny; końcowe
+> wartości pracy powinny pochodzić z wielokrotnie powtórzonego eksperymentu.
+
+#### Hipoteza do weryfikacji w eksperymencie R0/R1/R2
+
+> Ponieważ każda analiza ROI wymaga pełnej inferencji modelu MT o niezmiennym
+> rozmiarze wejścia, zwiększenie budżetu ROI może prowadzić do wzrostu, a nie
+> spadku opóźnienia. Kaskada z detektorem pojazdów powinna być zatem oceniana nie
+> tylko pod względem skuteczności lokalizacji tablicy, lecz także liczby
+> faktycznych uruchomień MT oraz częstości pełnoklatkowego fallbacku.
+
+Pozostało:
+
+- wykonać kontrolowane R1 i R2 oraz pełną serię R0/R1/R2;
+- wykonać co najmniej trzy powtórzenia każdego wariantu na tym samym materiale;
+- domknąć obsługę kolejności znaków dla tablic dwurzędowych;
+- zablokować lub jawnie raportować zmianę kluczowej konfiguracji eksperymentu
+  podczas aktywnej `ExperimentSession`;
+- po zamrożeniu wersji badawczej wykonać osobny eksperyment rozdzielczości oraz
+  ewentualny eksperyment optymalizacyjny MT.
+
+---
 
 # 6. Najważniejsze decyzje projektowe
 
@@ -1903,7 +2175,7 @@ się ręcznie.
 
 # 7. Weryfikacja
 
-Stan na 2026-08-23:
+Stan na 2026-08-24:
 
 | Kontrola | Wynik |
 | --- | --- |
@@ -1927,8 +2199,13 @@ Stan na 2026-08-23:
 | Ręczny Start/Stop analizy | potwierdzony na urządzeniu |
 | Czyszczenie podglądu po STOP | potwierdzone |
 | Pomiar tylko w aktywnej sesji analizy | potwierdzony; przebieg kontrolny 41,718 s |
-| `ExperimentSession` | zaprojektowany, jeszcze niewdrożony |
-| Opcjonalny `TimerConfig` | zaprojektowany, jeszcze niewdrożony |
+| `ExperimentSession` | wdrożony; ręczny STOP, ERROR, restart CameraX i eksport snapshotu potwierdzone |
+| Opcjonalny `TimerConfig` | wdrożony; 15 s i 60 s potwierdzone, timer nie zeruje się przy restarcie CameraX |
+| Dynamiczny katalog rozdzielczości kamery | potwierdzony; m.in. `640×480` i `4000×3000`, requested=actual |
+| Raport rozdzielczości `selected/requested/actual` | potwierdzony w `.alprsession` |
+| Galeria jako Bottom Sheet i pojedynczy Start/Stop | potwierdzone ręcznym przeglądem UI |
+| Statystyki MZ bez sztucznych `0 ms` | potwierdzone; `mz_runs=2`, `character_inference.count=2` |
+| Pomiar kontrolny wąskiego gardła | MT p50 ≈ 2973 ms, pipeline p50 ≈ 4634 ms na SM-A125F |
 | Parser raportu desktopowego | raport przyjęty |
 | Bramka jakości bez ground truth | poprawnie odrzucona |
 
@@ -1938,8 +2215,8 @@ Aktualny artefakt debug:
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Po zakończeniu zmian dotyczących badge'ów, kolejności znaków i warstwy
-eksperymentalnej należy ponownie uruchomić pełny zestaw regresyjny.
+Po zakończeniu zmian dotyczących badge'ów i kolejności znaków należy ponownie
+uruchomić pełny zestaw regresyjny przed zamrożeniem wersji badawczej.
 
 ---
 
@@ -2031,15 +2308,12 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 - przenieść `reading_order.py` do Androida;
 - poprawić postprocessing układów wielorzędowych;
 - dodać testy regresji tablic jedno- i dwurzędowych;
-- wdrożyć minimalny `ExperimentSession` z ID, stanem, czasem i powodem zakończenia;
-- dodać opcjonalny `TimerConfig` jako warunek zakończenia sesji;
 - wykonać kontrolne przebiegi R1 i R2;
 - wykonać pełne A/B/C strategii ROI:
   - R0 — MT pełna klatka;
   - R1 — MP→maks. 1 ROI→MT;
   - R2 — MP→maks. 2 ROI→MT;
 - wykonać kilka powtórzeń każdego wariantu na identycznym materiale;
-- poprawić statystyki MZ tak, aby pominięcie MZ nie było raportowane jako czas `0 ms`;
 - porównać runtime'y NCNN, ONNX i TFLite;
 - zamrozić protokół camera-in-the-loop;
 - wykonać pełny benchmark z ground truth;
