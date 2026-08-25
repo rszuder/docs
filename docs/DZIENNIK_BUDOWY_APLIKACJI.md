@@ -2538,6 +2538,227 @@ ukończoną.
 - po domknięciu bieżących zmian uruchomić pełny zestaw regresyjny;
 - kontynuować serię R0/R1/R2 na niezmienionej konfiguracji bazowej.
 
+
+### Domknięcie audytu czasu pipeline'u — rozdzielenie `INF/AUX/OVH` i koszt rotacji 12 MP
+
+#### Problem
+
+Po wcześniejszej obserwacji, że `PIPE` bywa znacznie większy od sumy czasów
+inferencji `MP + MT + MZ`, dodano pełniejszy bilans pojedynczej przetwarzanej
+klatki. Celem było rozstrzygnięcie, czy brakujący czas wynika z nieopomiarowanej
+logiki Java, czy z jawnych operacji pomocniczych otaczających modele.
+
+Wprowadzono trzy rozłączne pojęcia:
+
+```text
+INF = vehicle_inference + plate_inference + character_inference
+AUX = suma jawnie zmierzonych etapów pomocniczych
+      (pre/postprocessing, konwersja kamery, rektyfikacja, setup/finalizacja)
+OVH = PIPE - (INF + AUX)
+```
+
+`OVH` nie oznacza zatem czasu poza inferencją. Jest wyłącznie resztą, której nie
+udało się przypisać do żadnego jawnie zmierzonego etapu i pełni rolę kontroli
+kompletności pomiaru.
+
+#### Instrumentacja
+
+Do `InferenceTrace`/diagnostyki dodano m.in.:
+
+- `engine_setup`;
+- `engine_total`;
+- `pipeline_finalize`;
+- `inference_sum`;
+- `auxiliary_sum`;
+- `measured_stage_sum`;
+- `pipeline_overhead`;
+- `engine_measured_sum` i `engine_overhead`;
+- rozbicie konwersji kamery na `camera_to_bitmap` oraz `camera_rotation`;
+- diagnostyczny log `ALPR_TIMING_AUDIT` zawierający również liczbę uruchomień
+  MT na ROI/full-frame, liczbę prób MZ i rzeczywistą rozdzielczość źródła.
+
+Pomiar potwierdził, że `OVH` wynosił typowo około `63–69 ms` przy czasie
+pipeline'u rzędu `10–12 s`, czyli mniej niż 1% całego przebiegu. Oznacza to, że
+niemal cały czas został poprawnie przypisany do konkretnych etapów i nie
+występował wielosekundowy „ukryty” koszt pomiędzy licznikami.
+
+#### Identyfikacja kosztu rotacji pełnej bitmapy
+
+Dla źródła `4000×3000` i orientacji wymagającej obrotu o `90°` rozbito
+`camera_conversion` na dwie części. W stanie ustalonym otrzymano m.in.:
+
+```text
+frame=4
+CAM        = 3096,621 ms
+TO_BITMAP  =   52,714 ms
+ROTATE     = 3026,201 ms
+ROT        = 90°
+
+frame=6
+CAM        = 3524,660 ms
+TO_BITMAP  =   61,393 ms
+ROTATE     = 3445,532 ms
+ROT        = 90°
+```
+
+Sama konwersja `ImageProxy -> Bitmap` była więc relatywnie tania. Dominującym
+kosztem okazało się ręczne tworzenie obróconej bitmapy `4000×3000` przez
+`Bitmap.createBitmap(..., Matrix, ...)`.
+
+Zmiana parametru filtrowania z `true` na `false` zmniejszyła koszt, ale nie
+usunęła problemu: obrót nadal trwał około `3 s` dla pojedynczej 12-megapikselowej
+klatki.
+
+#### Optymalizacja — rotacja po stronie CameraX
+
+W `ImageAnalysis.Builder` włączono:
+
+```java
+.setOutputImageRotationEnabled(true)
+```
+
+Po zmianie CameraX dostarcza analizatorowi obraz już w docelowej orientacji.
+Rzeczywisty rozmiar raportowany przez analizator zmienił się z `4000×3000` na
+`3000×4000`, `rotationDegrees` spadło do `0`, a ręczna rotacja przestała być
+wykonywana:
+
+```text
+frame=4
+CAM        = 51,986 ms
+TO_BITMAP  = 51,875 ms
+ROTATE     = 0,000 ms
+ROT        = 0°
+
+frame=6
+CAM        = 54,624 ms
+TO_BITMAP  = 54,495 ms
+ROTATE     = 0,000 ms
+ROT        = 0°
+```
+
+Dla porównywalnych klatek w stanie ustalonym cały pipeline skrócił się:
+
+```text
+MZ wykonane:
+10,653 s -> 7,710 s   (-27,6%)
+
+bez nowej próby MZ:
+11,638 s -> 8,108 s   (-30,3%)
+```
+
+Koszt etapu `CAM` spadł odpowiednio o około `98,3–98,5%` względem wariantu z
+ręcznym obrotem pełnej bitmapy.
+
+Pierwsza klatka po uruchomieniu nie jest używana do tego porównania jako wynik
+steady-state, ponieważ zawiera dodatkowy koszt inicjalizacji silnika i backendów.
+
+#### Dodatkowy wniosek — dwa ROI oznaczają dwa pełne uruchomienia MT
+
+Log `ALPR_TIMING_AUDIT` potwierdził dla wariantu `R2`:
+
+```text
+MT_ROI = 2
+MT_FULL = 0
+MT_INF ≈ 5,8–5,9 s
+```
+
+Wartość `plate_inference` jest sumą uruchomień MT w danej iteracji. Oznacza to
+około `2,9–3,0 s` na pojedyncze wykonanie MT, co jest zgodne z wcześniejszym
+baseline'em `p50 ≈ 2,97 s`. Wzrost czasu R2 nie oznacza więc spowolnienia jednej
+inferencji MT; wynika z wykonania dwóch pełnych inferencji dla dwóch ROI.
+
+Po optymalizacji rotacji, dla przykładowych klatek steady-state, same inferencje
+stanowiły około `78–83%` całego czasu pipeline'u. Głównym kosztem ponownie stało
+się więc wykonywanie modeli, przede wszystkim wielokrotne MT, a nie obsługa
+pełnej bitmapy kamery.
+
+#### Kontrola granicy pomiaru CameraX
+
+Koszt `setOutputImageRotationEnabled(true)` może być technicznie wykonywany przed
+wejściem do metody `process()`, więc sam spadek `PIPE` nie wystarczałby do
+stwierdzenia poprawy przepustowości. Pomocniczo porównano odstępy czasowe między
+kolejnymi logami zakończonych iteracji z odpowiadającymi im czasami `PIPE`.
+Różnica wynosiła około `0,2–0,25 s`, a nie kilka sekund. Nie ma więc przesłanki,
+że dawny koszt `3–4 s` został jedynie przeniesiony poza licznik `PIPE`.
+
+Jest to wniosek diagnostyczny dla badanego urządzenia, a nie uniwersalna gwarancja
+wydajności CameraX na wszystkich telefonach. W eksperymencie końcowym należy
+raportować także rzeczywistą przepustowość/odstęp między przetworzonymi klatkami.
+
+#### Gotowiec do pracy — pełny budżet czasu zamiast samej inferencji
+
+> Czas wykonania modelu nie jest równoważny czasowi przetwarzania pojedynczej
+> klatki przez kompletny system ALPR. W aplikacji mobilnej rozdzielono czas
+> inferencji sieci neuronowych (`INF`) od kosztu operacji pomocniczych (`AUX`),
+> obejmujących m.in. konwersję obrazu, preprocessing, postprocessing i
+> rektyfikację. Dodatkowo wyznaczono resztę `OVH`, rozumianą jako różnicę między
+> pełnym czasem pipeline'u a sumą wszystkich jawnie zmierzonych etapów. W
+> przeprowadzonym audycie `OVH` stanowił mniej niż 1% czasu przetwarzania, co
+> potwierdziło, że obserwowana wcześniej różnica między sumą inferencji a czasem
+> całego pipeline'u wynikała przede wszystkim z mierzalnych etapów pomocniczych,
+> a nie z nieznanego narzutu wykonawczego.
+
+#### Gotowiec do pracy — wpływ rotacji obrazu wysokiej rozdzielczości
+
+> W przypadku źródła `4000×3000` stwierdzono, że ręczny obrót pełnej bitmapy o
+> 90° po konwersji z `ImageProxy` stanowił istotne wąskie gardło. Sama operacja
+> `ImageProxy -> Bitmap` trwała około `53–61 ms`, podczas gdy utworzenie
+> obróconej bitmapy wymagało około `3,0–3,45 s`. Po przeniesieniu odpowiedzialności
+> za rotację do `ImageAnalysis` CameraX analizator otrzymywał obraz w docelowej
+> orientacji (`rotationDegrees = 0`), a zmierzony wewnątrz pipeline'u koszt
+> konwersji spadł do około `52–55 ms`. Dla porównywalnych klatek steady-state
+> czas pełnego pipeline'u zmniejszył się o około `28–30%`. Wynik pokazuje, że
+> przekształcenia pełnorozdzielczych bitmap mogą stanowić koszt porównywalny z
+> obliczeniami sieci neuronowych i powinny być uwzględniane w analizie
+> wydajności mobilnego systemu ALPR.
+
+#### Gotowiec do pracy — znaczenie budżetu ROI
+
+> W wariancie z dwoma ROI (`R2`) łączny czas inferencji MT wynosił około
+> `5,8–5,9 s`, przy czym licznik wykonania potwierdzał dwa osobne uruchomienia
+> modelu. Czas pojedynczej inferencji pozostawał zbliżony do wcześniejszego
+> baseline'u około `2,97 s`. Oznacza to, że ograniczenie przestrzenne obrazu do
+> ROI nie obniża kosztu pojedynczego wywołania modelu o stałym wejściu `640×640`;
+> zwiększenie liczby ROI może natomiast niemal liniowo zwiększać łączny koszt MT.
+> Z tego względu warianty R0, R1 i R2 powinny być porównywane jako odmienne
+> strategie harmonogramu i jakości lokalizacji, a nie jako prosta optymalizacja
+> czasu inferencji pojedynczego modelu.
+
+#### Decyzje
+
+- `setOutputImageRotationEnabled(true)` pozostaje aktywne w bazowej konfiguracji
+  CameraX;
+- awaryjna obsługa niezerowego `rotationDegrees` pozostaje w
+  `CameraImageConverter`, ale w normalnym przebiegu nie wykonuje pracy;
+- `OVH` pozostaje metryką kontrolną w trace/raporcie, lecz do codziennej
+  interpretacji HUD bardziej użyteczne są `INF` i `AUX`;
+- audyt budżetu czasu uznaje się za domknięty na poziomie potrzebnym przed
+  eksperymentem R0/R1/R2;
+- bazowego modelu MT nie należy teraz zmieniać, aby nie mieszać wpływu strategii
+  ROI z wpływem optymalizacji modelu;
+- eksperyment autozoomu pozostaje osobnym etapem po bazowej serii R0/R1/R2.
+
+#### Weryfikacja
+
+- `ALPR_TIMING_AUDIT` działa na fizycznym urządzeniu;
+- `INF/AUX/OVH` sumują się do pełnego budżetu klatki z resztą poniżej 1%;
+- rozbicie `camera_conversion` na `camera_to_bitmap` i `camera_rotation`
+  potwierdziło dominujący koszt ręcznej rotacji 12 MP;
+- po włączeniu rotacji CameraX: `SRC=3000x4000`, `ROT=0`, `CAM_ROT=0`;
+- porównywalne klatki steady-state wykazały skrócenie `PIPE` o około `27,6%` i
+  `30,3%`;
+- `MT_ROI=2` oraz zagregowany czas `MT_INF` potwierdzają dwa pełne uruchomienia MT
+  w wariancie R2.
+
+#### Pozostało
+
+- uprościć HUD do czytelnego rozróżnienia `PIPE / INF / AUX`; `OVH` pozostawić
+  przede wszystkim w trace i raporcie;
+- wykonać kontrolowane przebiegi R0, R1 i R2 po tej samej wersji kodu;
+- rozszerzyć `CropSamplingPolicy` o istotny wzrost `recognitionConfidence`;
+- po bazowej serii R0/R1/R2 wrócić do eksperymentu autozoomu;
+- wykonać pełny zestaw regresyjny przed zamrożeniem wersji badawczej.
+
 ---
 
 # 6. Najważniejsze decyzje projektowe
@@ -2663,7 +2884,7 @@ Stan na 2026-08-25:
 | `PreviewPlateTracker` | wersja wielotablicowa potwierdzona ręcznie; ramka PLATE pozostaje widoczna między inferencjami |
 | `VEHICLE/VEHICLE_ROI` śledzone przez ruch tablicy | potwierdzone ręcznie |
 | Animacja quada PLATE | interpolacja keypointów dostępna; końcowy test renderera po ostatniej zmianie otwarty |
-| Audyt `PIPE/SUM/OVH` | zaplanowany; bieżący HUD ujawnił potrzebę rozdzielenia inferencji od pełnego kosztu klatki |
+| Audyt `PIPE/INF/AUX/OVH` | wykonany na urządzeniu; `OVH` <1%, główny koszt pomocniczy 12 MP stanowiła ręczna rotacja bitmapy |
 | Parser raportu desktopowego | raport przyjęty |
 | Bramka jakości bez ground truth | poprawnie odrzucona |
 
@@ -2673,9 +2894,10 @@ Aktualny artefakt debug:
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Po zakończeniu audytu czasu, zmian polityki cropów i końcowej walidacji warstwy
+Po zmianie polityki cropów, bazowej serii R0/R1/R2 i końcowej walidacji warstwy
 tracking/scene należy ponownie uruchomić pełny zestaw regresyjny przed zamrożeniem
-wersji badawczej.
+wersji badawczej. Audyt czasu pipeline'u i optymalizację rotacji 12 MP uznaje się
+za wykonane.
 
 ---
 
@@ -2762,10 +2984,10 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 
 ## Priorytet wysoki
 
-- wykonać audyt pełnego czasu klatki i rozdzielić `PIPE`, sumę znanych etapów oraz
-  niewyjaśniony narzut `OVH`;
-- dodać do diagnostyki/raportu pomocnicze `SUM` i `OVH`, a przy dużym `OVH`
-  zinstrumentować brakujące fragmenty `MobileAlprEngine`;
+- utrzymać diagnostyczny bilans `PIPE/INF/AUX/OVH` w trace/raporcie i uprościć
+  HUD do wartości przydatnych podczas pracy (`PIPE`, `INF`, `AUX`);
+- wykonać bazową serię R0/R1/R2 po optymalizacji rotacji CameraX, bez zmiany
+  modeli i ich wejść;
 - rozszerzyć `CropSamplingPolicy` o zapis przy istotnej poprawie
   `recognitionConfidence`, bez usuwania wcześniejszych słabszych cropów;
 - wykonać końcowy test animowanego quada i kalibrację unieważniania sceny przy
