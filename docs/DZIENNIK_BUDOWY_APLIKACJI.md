@@ -65,7 +65,7 @@ na urządzeniu.
 
 ## 3. Stos technologiczny
 
-Stan na 2026-08-24:
+Stan na 2026-08-25:
 
 | Obszar | Rozwiązanie |
 | --- | --- |
@@ -2273,6 +2273,273 @@ Pozostało:
 
 ---
 
+
+## 2026-08-25 — responsywny overlay między inferencjami, śledzenie wielu tablic, semantyka świeżości wyniku i nowe kierunki badawcze
+
+### Problem — ciężki pipeline i nieciągła prezentacja wyniku
+
+Przy czasie pojedynczego przebiegu liczonym w sekundach wynik MP/MT/MZ dociera do
+warstwy UI znacznie rzadziej niż kolejne klatki `PreviewView`. Powodowało to kilka
+niezależnych problemów prezentacyjnych:
+
+- ramka tablicy mogła pozostawać nieruchoma do chwili nadejścia kolejnego MT;
+- przy zmianie sceny stary overlay i HUD mogły przez pewien czas opisywać poprzedni
+  obraz;
+- `VEHICLE` i `VEHICLE_ROI` były jedynie migawką ostatniego MP i po upływie
+  sztucznego TTL znikały;
+- komunikat `MZ w tej klatce: 0` mógł występować jednocześnie z widocznym numerem,
+  ponieważ numer pochodził z pamięci temporalnej tracku, a nie z nowej inferencji MZ;
+- przy więcej niż jednej tablicy pierwszy prototyp lekkiego trackera nie zapewniał
+  niezależnego śledzenia wszystkich obiektów.
+
+Problem nie dotyczył wyłącznie estetyki. Warstwa prezentacji musi jednoznacznie
+odróżniać świeżą obserwację modelu od informacji przeniesionej pomiędzy drogimi
+inferencjami.
+
+### Rozwiązanie — lekki `PreviewPlateTracker` niezależny od ciężkiego analizatora
+
+Dodano tracker pracujący na bitmapach pobieranych bezpośrednio z `PreviewView`,
+niezależnie od głównego analizatora CameraX. Tracker działa na zmniejszonym obrazie
+w skali szarości i wykonuje lokalne dopasowanie fragmentów obrazu wokół narożników
+quada tablicy.
+
+Wersja wieloobiektowa:
+
+- utrzymuje osobny `TrackState` dla każdej tablicy;
+- przy świeżym wyniku MT kotwiczy wszystkie prawidłowe elementy `PLATE`;
+- aktualizuje położenie na lekkich klatkach Preview pomiędzy kolejnymi wynikami MT;
+- toleruje krótką serię nieudanych dopasowań, aby pojedynczy miss nie powodował
+  migotania;
+- po utracie wszystkich aktywnych tracków zwraca jawnie pustą listę, co powoduje
+  unieważnienie starego overlayu;
+- po świeżym MT jest ponownie kotwiczony dokładną geometrią modelu.
+
+Bieżąca wersja trackera estymuje przede wszystkim translację quada. Cztery narożniki
+są przechowywane osobno, ale ruch pomiędzy ciężkimi inferencjami jest jeszcze
+sprowadzany do wspólnego przesunięcia. Niezależne śledzenie deformacji/perspektywy
+każdego narożnika pozostaje możliwym rozszerzeniem.
+
+Weryfikacja ręczna potwierdziła, że ramka `PLATE` pozostaje widoczna i podąża za
+obiektem pomiędzy inferencjami. Potwierdzono również działanie wersji wielotablicowej.
+
+### Rozwiązanie — `VEHICLE` i `VEHICLE_ROI` podążające za tablicą
+
+Sztuczny czas życia pomarańczowych ramek został uznany za mylący. Ostatni prawidłowy
+wynik MP ma znaczenie diagnostyczne do chwili kolejnego wyniku albo zmiany sceny.
+
+Przyjęto lekki kompromis zamiast uruchamiania drugiego trackera pojazdów:
+
+```text
+ostatni wynik MP/MT
+  -> VEHICLE
+  -> VEHICLE_ROI
+  -> PLATE bazowa
+
+PreviewPlateTracker
+  -> aktualna PLATE
+  -> dx, dy względem PLATE bazowej
+  -> to samo przesunięcie stosowane do VEHICLE i VEHICLE_ROI
+```
+
+Dla wielu pojazdów element diagnostyczny jest kojarzony z tablicą znajdującą się
+wewnątrz jego obszaru, a następnie z odpowiadającym jej `trackId`. Nie jest to
+pełnoprawny tracker pojazdów — ruch ramki MP jest wyprowadzany z ruchu tablicy — ale
+pozwala zachować spójność wizualną bez kolejnego kosztownego algorytmu.
+
+Weryfikacja ręczna na urządzeniu: rozwiązanie działa.
+
+### Rozwiązanie — płynna korekta overlayu i geometria quada
+
+`DetectionOverlayView` wykorzystuje krótką animację pomiędzy kolejnymi znanymi
+położeniami. Elementy `PLATE` są dopasowywane po `trackId`, natomiast `VEHICLE` i
+`VEHICLE_ROI` geometrycznie. Interpolowane mogą być nie tylko współrzędne bbox,
+lecz również listy keypointów.
+
+Dla tablicy właściwą reprezentacją wizualną pozostaje czworokąt wyznaczony przez
+cztery narożniki MT. Mechanizm interpolacji keypointów jest gotowy do płynnego
+morfowania quada pomiędzy kolejnymi obserwacjami MT. Końcowa weryfikacja wyglądu
+animowanego quada po ostatniej zmianie renderera pozostaje do wykonania.
+
+### Rozwiązanie — świeżość sceny i unieważnianie spóźnionych wyników
+
+Dodano lekką warstwę obserwującą rzeczywisty obraz `PreviewView` niezależnie od
+ciężkiego pipeline'u:
+
+- `uiSceneGeneration` identyfikuje generację aktualnej sceny;
+- wynik ciężkiej inferencji rozpoczętej przed zmianą generacji jest odrzucany;
+- reset z UI jest przekazywany do pipeline'u jako nieblokujące
+  `requestTrackingReset()` i wykonywany przed następnym `engine.run()`;
+- `SceneChangeDetector` działa również na lekkich klatkach Preview;
+- `SceneAnchorGuard` porównuje obraz z referencją ustawioną po świeżej obserwacji MT;
+- po unieważnieniu sceny czyszczone są trackery, overlay diagnostyczny i stan HUD;
+- HUD pokazuje kreski do chwili nadejścia pierwszego świeżego wyniku nowej sceny.
+
+Mechanizm poprawia responsywność, ale `SceneAnchorGuard` nadal wymaga końcowej
+kalibracji dla ruchu kamery: kontrolowana zmiana położenia nie powinna być mylona z
+całkowicie nową sceną.
+
+### Rozwiązanie — oddzielenie „wyniku MZ” od „MZ wykonano teraz”
+
+Wynik tekstowy może pozostać dostępny z temporalnego stanu tracku, mimo że w
+bieżącej klatce MZ nie zostało uruchomione. Zmieniono semantykę komunikatów i
+etykiet:
+
+```text
+świeża próba MZ:
+  <numer>
+
+brak nowej próby MZ, wynik historyczny:
+  <numer> · pamięć
+```
+
+Analogicznie komunikat statusu nie interpretuje już `MZ = 0` jako braku
+rozpoznania, lecz jako „bez nowej próby; wynik z pamięci”.
+
+Decyzja:
+
+> Położenie tablicy, wynik tekstowy i fakt wykonania MZ są trzema różnymi
+> informacjami. UI nie może sugerować, że model znaków pracował w każdej klatce
+> tylko dlatego, że tekst pozostaje widoczny.
+
+### Nowa obserwacja badawcza — różnica między `PIPE` a sumą inferencji
+
+Podczas obserwacji HUD zauważono, że czas `PIPE` może być znacznie większy od sumy
+czasów pokazywanych jako `MP + MT + MZ`, w niektórych bieżących przebiegach co
+najmniej około dwukrotnie.
+
+Nie oznacza to automatycznie ukrytego opóźnienia modelu. HUD pokazuje dla MP, MT i
+MZ wyłącznie czasy samego `backend.run()`, natomiast `PIPE` obejmuje cały przebieg
+od rozpoczęcia przetwarzania klatki do zakończenia `engine.run()`. Poza czystymi
+inferencjami występują m.in.:
+
+- konwersja `ImageProxy -> Bitmap` i ewentualny obrót bitmapy;
+- preprocessing MP, MT i MZ;
+- postprocessing i dekodowanie wyników;
+- wielokrotne uruchomienia MT dla kilku ROI lub fallbacku pełnoklatkowego;
+- deduplikacja, scoring jakości i tracking;
+- rektyfikacja perspektywy;
+- kolejność znaków i konsensus temporalny;
+- tworzenie obiektów wynikowych i kopii bitmap cropów;
+- pozostała logika Java pomiędzy mierzonymi etapami.
+
+Dotychczasowy pomiar kontrolny `640×480` wykazał już, że preprocessing MP i MT jest
+istotny, ale nowa obserwacja uzasadnia osobny **audyt budżetu czasu klatki**.
+
+Planowany eksperyment:
+
+```text
+PIPE
+  - camera_conversion
+  - MP preprocess / inference / postprocess
+  - MT preprocess / inference / postprocess
+  - rectification
+  - MZ preprocess / inference / postprocess
+  = niewyjaśniony narzut (OVH)
+```
+
+Do HUD i raportu warto dodać `SUM` oraz `OVH`, a następnie — jeżeli `OVH` nadal
+pozostanie duży — instrumentować kolejne fragmenty `MobileAlprEngine` aż do
+wyjaśnienia różnicy. Przed wdrożeniem autozoomu audyt czasu ma wyższy priorytet,
+ponieważ dodatkowa próba MT/MZ zwiększy koszt przetwarzania.
+
+### Plan — rozszerzenie polityki cropów o poprawę confidence
+
+Obecna `CropSamplingPolicy` zapisuje pierwszy crop tracku, zmianę tekstu, pierwsze
+potwierdzenie, istotną poprawę ostrości oraz próbkę okresową. Nie uwzględnia jednak
+wyraźnej poprawy `recognitionConfidence`, jeżeli tekst pozostał taki sam.
+
+Planowana zmiana:
+
+- `Previous` otrzyma `recognitionConfidence`;
+- wzrost confidence MZ o ustalony próg, początkowo np. `0.10`, stanie się osobnym
+  powodem zapisu;
+- wcześniejsze słabsze lub błędne cropy nie będą usuwane, ponieważ stanowią
+  wartościowy materiał do analizy przebiegu rozpoznawania;
+- raport będzie mógł zachować sekwencję obserwacji od słabego wyniku do wyniku
+  potwierdzonego.
+
+Zmiana jest zaplanowana, ale na moment aktualizacji dziennika nie została jeszcze
+wdrożona.
+
+### Plan badawczy — adaptacyjny zoom i ponowna próba rozpoznania
+
+Powstała koncepcja wykorzystania sterowania kamerą po uzyskaniu stabilnej ramki
+tablicy. Docelowy przepływ nie powinien wykonywać MZ na starej geometrii po zmianie
+zoomu, lecz ponownie przejść przez lokalizację tablicy:
+
+```text
+MT
+  -> tablica zbyt mała / MZ mało pewne / brak stabilizacji
+  -> AUTO ZOOM + AF/AE na tablicę
+  -> krótka stabilizacja kamery
+  -> ponowne MT
+  -> nowy quad i rektyfikacja
+  -> ponowne MZ
+  -> porównanie wyniku przed i po zoomie
+```
+
+W kodzie funkcja powinna być traktowana jako `AutoZoomController`, a nie
+`OpticalZoomController`, ponieważ CameraX może realizować żądany zoom przez zmianę
+obiektywu fizycznego, crop cyfrowy albo kombinację obu metod zależnie od urządzenia.
+
+Wymagania projektowe przed implementacją:
+
+- najwyżej jedna kontrolowana próba zoom dla danego tracku;
+- jawny stan np. `NORMAL -> ZOOM_REQUESTED -> ZOOM_SETTLING -> ZOOMED_RETRY -> DONE`;
+- wybór jednego tracku priorytetowego przy wielu tablicach;
+- blokada reakcji `SceneChangeDetector/SceneAnchorGuard` na zmianę obrazu wywołaną
+  świadomie przez aplikację;
+- zapis `zoom_ratio` i źródła próby w metadanych cropu/raportu;
+- osobne porównanie confidence i skuteczności przed/po zoomie.
+
+Autozoom pozostaje hipotezą i planem eksperymentalnym; nie jest jeszcze funkcją
+ukończoną.
+
+### Decyzje z sesji 2026-08-25
+
+- warstwa UI może śledzić obiekt częściej niż wykonywane są modele, ale musi
+  zachowywać informację o pochodzeniu wyniku;
+- `PLATE` jest aktywnie śledzona na lekkich klatkach Preview pomiędzy MT;
+- `VEHICLE` i `VEHICLE_ROI` mogą być wizualnie przenoszone wraz z przypisaną
+  tablicą bez uruchamiania osobnego trackera pojazdów;
+- wynik tekstowy z konsensusu temporalnego nie oznacza wykonania MZ w bieżącej
+  klatce;
+- spóźniony wynik ciężkiego pipeline'u nie może ponownie narysować starej sceny;
+- wcześniejsze słabe cropy są materiałem badawczym i nie powinny być automatycznie
+  zastępowane lepszymi;
+- przed dokładaniem autozoomu należy wyjaśnić pełny budżet czasu `PIPE` i narzut
+  poza samymi inferencjami;
+- autozoom będzie oddzielnym eksperymentem, a nie ukrytą optymalizacją bazowego
+  porównania R0/R1/R2.
+
+### Weryfikacja
+
+- wielotablicowy `PreviewPlateTracker` — potwierdzony ręcznie;
+- stała widoczność ramki tablicy pomiędzy inferencjami — potwierdzona ręcznie;
+- wspólne przesuwanie `VEHICLE/VEHICLE_ROI` wraz z przypisaną tablicą — potwierdzone
+  ręcznie;
+- semantyka `wynik z pamięci` dla klatki bez nowej próby MZ — obecna w kodzie;
+- animacja/interpolacja geometrii overlayu — obecna w kodzie, końcowy test
+  animowanego quada pozostaje otwarty;
+- końcowa kalibracja unieważniania sceny przy ruchu kamery — otwarta;
+- rozszerzona polityka cropów o `recognitionConfidence` — plan, nie wdrożono;
+- adaptacyjny autozoom — plan, nie wdrożono;
+- audyt `PIPE vs SUM vs OVH` — plan eksperymentalny, nie wykonano.
+
+### Pozostało
+
+- wykonać audyt czasu klatki i dodać `SUM/OVH` do diagnostyki;
+- rozszerzyć `CropSamplingPolicy` o istotny wzrost `recognitionConfidence`;
+- po audycie czasu zaprojektować i wdrożyć `AutoZoomController`;
+- dodać metadane zoomu do cropów i raportu przed eksperymentem zoomu;
+- przetestować końcowy animowany quad na urządzeniu;
+- skalibrować `SceneAnchorGuard` dla ruchu kamery i przyszłej kontrolowanej zmiany
+  zoomu;
+- po domknięciu bieżących zmian uruchomić pełny zestaw regresyjny;
+- kontynuować serię R0/R1/R2 na niezmienionej konfiguracji bazowej.
+
+---
+
 # 6. Najważniejsze decyzje projektowe
 
 ## Pakiet zamiast surowych wag
@@ -2338,11 +2605,31 @@ Ograniczenie czasowe ma być dodatkowym warunkiem zakończenia eksperymentu, a
 nie częścią obowiązkową wszystkich przebiegów. Eksperyment bez timera kończy
 się ręcznie.
 
+
+## Ciągłość UI jest oddzielna od częstotliwości inferencji
+
+Ciężki pipeline może analizować klatki znacznie rzadziej niż odświeżany jest
+`PreviewView`. Dlatego ciągłość overlayu jest realizowana lekkim trackerem obrazu,
+a nie przez udawanie, że MP/MT/MZ wykonały się w każdej klatce podglądu.
+
+## Świeży wynik modelu i wynik z pamięci są rozróżniane
+
+Widoczny numer rejestracyjny może pochodzić z konsensusu temporalnego mimo braku
+nowej próby MZ. UI ma jawnie sygnalizować pochodzenie wyniku, a metryki inferencji
+mają opisywać wyłącznie rzeczywiście wykonane etapy.
+
+## Pomiar pełnego pipeline'u wymaga bilansu czasu
+
+`total` nie może być interpretowany jako suma samych czasów `backend.run()`.
+Analiza wydajności ma obejmować preprocessing, postprocessing, konwersję kamery,
+rektyfikację i pozostały narzut. Planowany bilans `PIPE = SUM + OVH` ma wskazać,
+czy po uwzględnieniu znanych etapów pozostaje istotny niezmierzony koszt.
+
 ---
 
 # 7. Weryfikacja
 
-Stan na 2026-08-24:
+Stan na 2026-08-25:
 
 | Kontrola | Wynik |
 | --- | --- |
@@ -2356,9 +2643,9 @@ Stan na 2026-08-24:
 | `VEHICLE` + `VEHICLE_ROI` | potwierdzone wizualnie |
 | `SceneChangeDetector` | potwierdzony w kilku przebiegach |
 | Reset tracków po zmianie sceny | potwierdzony w logach |
-| Reset pojedynczej starej ramki UI | wymaga końcowego testu wizualnego |
-| Badge numeru przy aktywnym MP | problem zdiagnozowany, finalna weryfikacja otwarta |
-| Ulepszona obsługa tablic dwurzędowych | analiza zakończona, implementacja otwarta |
+| Reset pojedynczej starej ramki UI | mechanizm generacji sceny i lekkiego resetu wdrożony; końcowa kalibracja ruchu kamery pozostaje otwarta |
+| Semantyka wyniku MZ bez nowej próby | wynik z pamięci jest jawnie odróżniony od świeżej inferencji MZ |
+| Rzędowość i konsensus temporalny | implementacja i testy jednostkowe struktury wierszy wykonane; dalsza walidacja na materiale dwurzędowym trwa |
 | Filtr klas MP | potwierdzony na rzeczywistych logach; COCO `[2,3,5,7]` |
 | Polityka R0/R1/R2 | implementacja gotowa; R0 potwierdzone w `.alprsession` |
 | Rozdzielenie normalnej konfiguracji i EXP | potwierdzone ręcznie |
@@ -2373,6 +2660,10 @@ Stan na 2026-08-24:
 | Galeria jako Bottom Sheet i pojedynczy Start/Stop | potwierdzone ręcznym przeglądem UI |
 | Statystyki MZ bez sztucznych `0 ms` | potwierdzone; `mz_runs=2`, `character_inference.count=2` |
 | Pomiar kontrolny wąskiego gardła | MT p50 ≈ 2973 ms, pipeline p50 ≈ 4634 ms na SM-A125F |
+| `PreviewPlateTracker` | wersja wielotablicowa potwierdzona ręcznie; ramka PLATE pozostaje widoczna między inferencjami |
+| `VEHICLE/VEHICLE_ROI` śledzone przez ruch tablicy | potwierdzone ręcznie |
+| Animacja quada PLATE | interpolacja keypointów dostępna; końcowy test renderera po ostatniej zmianie otwarty |
+| Audyt `PIPE/SUM/OVH` | zaplanowany; bieżący HUD ujawnił potrzebę rozdzielenia inferencji od pełnego kosztu klatki |
 | Parser raportu desktopowego | raport przyjęty |
 | Bramka jakości bez ground truth | poprawnie odrzucona |
 
@@ -2382,8 +2673,9 @@ Aktualny artefakt debug:
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Po zakończeniu zmian dotyczących badge'ów i kolejności znaków należy ponownie
-uruchomić pełny zestaw regresyjny przed zamrożeniem wersji badawczej.
+Po zakończeniu audytu czasu, zmian polityki cropów i końcowej walidacji warstwy
+tracking/scene należy ponownie uruchomić pełny zestaw regresyjny przed zamrożeniem
+wersji badawczej.
 
 ---
 
@@ -2470,11 +2762,16 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 
 ## Priorytet wysoki
 
-- zakończyć poprawkę badge'a tekstu tablicy;
-- wykonać wizualny test resetu sceny obejmujący UI;
-- przenieść `reading_order.py` do Androida;
-- poprawić postprocessing układów wielorzędowych;
-- dodać testy regresji tablic jedno- i dwurzędowych;
+- wykonać audyt pełnego czasu klatki i rozdzielić `PIPE`, sumę znanych etapów oraz
+  niewyjaśniony narzut `OVH`;
+- dodać do diagnostyki/raportu pomocnicze `SUM` i `OVH`, a przy dużym `OVH`
+  zinstrumentować brakujące fragmenty `MobileAlprEngine`;
+- rozszerzyć `CropSamplingPolicy` o zapis przy istotnej poprawie
+  `recognitionConfidence`, bez usuwania wcześniejszych słabszych cropów;
+- wykonać końcowy test animowanego quada i kalibrację unieważniania sceny przy
+  ruchu kamery;
+- po audycie czasu zaprojektować `AutoZoomController` i protokół eksperymentu
+  przed/po zoomie; nie mieszać tego eksperymentu z bazowym R0/R1/R2;
 - wykonać kontrolne przebiegi R1 i R2;
 - wykonać pełne A/B/C strategii ROI:
   - R0 — MT pełna klatka;
@@ -2484,7 +2781,8 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 - porównać runtime'y NCNN, ONNX i TFLite;
 - zamrozić protokół camera-in-the-loop;
 - wykonać pełny benchmark z ground truth;
-- porównać Android z referencyjną inferencją Python.
+- porównać Android z referencyjną inferencją Python;
+- po domknięciu bieżących zmian uruchomić pełny zestaw regresyjny.
 
 ## Priorytet średni
 
@@ -2492,8 +2790,11 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 - raportować liczbę `scene_reset`;
 - powiązać `track_id` ze sceną;
 - rozważyć monotoniczne `track_id` w obrębie sesji;
-- rozważyć strukturę rzędów w `PlateObservation`;
+- rozszerzyć `PlateObservation` i raport o strukturę wierszy, jeżeli będzie potrzebna
+  do analizy wyników;
 - rozważyć głosowanie temporalne po `(row, col)`;
+- przed eksperymentem zoomu dodać `zoom_ratio`, źródło próby i stan autozoomu do
+  metadanych cropów/raportu;
 - ograniczyć logi diagnostyczne;
 - dopracować importer `.alprsession` po stronie Python;
 - dodać jawną bramkę jakości dla INT8.
@@ -2505,7 +2806,10 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 - NNAPI/NPU, jeżeli runtime i urządzenie zapewnią stabilne wsparcie;
 - tryb testowania wyłącznie MZ;
 - porównanie kilku kompletnych kompozycji bez ponownego importu;
-- uczony model temporalny jako oddzielny eksperyment.
+- uczony model temporalny jako oddzielny eksperyment;
+- niezależne śledzenie czterech narożników quada pomiędzy inferencjami MT;
+- wymuszenie konkretnego fizycznego teleobiektywu dopiero jako osobny, zależny od
+  urządzenia eksperyment po wersji opartej na ogólnym `CameraControl` zoom.
 
 ---
 
