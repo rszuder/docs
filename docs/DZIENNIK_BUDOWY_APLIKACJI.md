@@ -65,7 +65,7 @@ na urządzeniu.
 
 ## 3. Stos technologiczny
 
-Stan na 2026-08-25:
+Stan na 2026-08-26:
 
 | Obszar | Rozwiązanie |
 | --- | --- |
@@ -100,6 +100,12 @@ MZ / TFLite / INT8
 
 Każdy etap zachowuje własny kontrakt wejścia, wyjścia, layoutu tensora,
 progów, wariantu wykonawczego i autotuningu.
+
+Warstwa kamery zawiera również opcjonalny auto-zoom oparty na `CameraControl`.
+Funkcja jest sterowana przez `AutoZoomController`, blokuje pojedynczy cel przez
+`AutoZoomTargetLock`, utrzymuje tekst w `AutoZoomRecognitionMemory` i korzysta z
+osobnej generacji transformacji kamery, aby kontrolowanego zoomu nie traktować
+jak zmiany logicznej sceny.
 
 ---
 
@@ -3634,7 +3640,7 @@ telefonie i powiązać go z obserwowanymi statusami TH oraz spadkiem wydajności
 
 # 7. Weryfikacja
 
-Stan na 2026-08-25:
+Stan na 2026-08-26:
 
 | Kontrola | Wynik |
 | --- | --- |
@@ -3685,11 +3691,15 @@ Stan na 2026-08-25:
 - bezpośredni eksport `.alprsession` po zakończonym eksperymencie działa;
 - timer pozostaje ustawiony po zakończeniu sesji;
 - `ThermalMonitor` i `ThermalConfig` są obecne w repozytorium;
-- odczyt `Thermal Headroom` nie jest jeszcze obecny w aktualnym
-  `ThermalMonitor.java`;
-- pełny `lintDebug` i komplet testów instrumentalnych nie były ponownie
-  uruchamiane po wszystkich zmianach UI/termicznych; przed finalnym
-  zamrożeniem wersji wymagany jest pełny przebieg regresyjny.
+- `ThermalMonitor` odczytuje również `Thermal Headroom`; HEAD jest próbkowany
+  nie częściej niż co 10 s i pozostaje wartością obserwacyjną, a nie kryterium
+  startu eksperymentu;
+- po wdrożeniu auto-zoomu dodano testy `AutoZoomControllerTest`,
+  `AutoZoomOverlayTransformTest`, `AutoZoomTargetLockTest`,
+  `PreviewTrackerDriftGuardTest` i `AutoZoomRecognitionMemoryTest`;
+- pełne `testDebugUnitTest` oraz `lintDebug` po integracji auto-zoomu zakończyły
+  się powodzeniem; najnowsza wersja auto-zoomu wymaga jeszcze końcowej
+  weryfikacji kamera–monitor na fizycznym urządzeniu.
 
 
 Aktualny artefakt debug:
@@ -3708,19 +3718,26 @@ za wykonane.
 
 # 8. Otwarte zadania i ryzyka
 
-## Najbliższe kroki po pierwszym kontrolowanym S2
+## Najbliższe kroki po integracji auto-zoomu
 
-1. wykonać drugie kontrolowane powtórzenie S2 w kolejności R0 → R1 → R2 przy
-   tej samej bramce termicznej;
-2. wykonać trzecie powtórzenie tylko wtedy, gdy druga seria da wynik odstający,
-   zmianę liczby ROI albo nietypowy fallback;
-3. rozszerzyć raport o jawny snapshot termiczny START/STOP;
-4. dodać obserwacyjny `Thermal Headroom` do monitora i raportu, ale nie używać go
-   jako progu do czasu zebrania danych kalibracyjnych;
-5. zsynchronizować `docs/mobile_architecture.md` i
-   `docs/mobile_research_export.md` z aktualnym kodem;
-6. po domknięciu badania ROI przejść do eksperymentu rozdzielczości źródła;
-7. przed zamrożeniem wersji badawczej wykonać pełny zestaw regresyjny.
+1. wykonać końcową próbę urządzeniową pełnego cyklu auto-zoom:
+   detekcja → zoom-in → świeże MT → wymuszona próba MZ → zoom-out → zachowanie
+   geometrii i najlepszego tekstu przy `1x`;
+2. sprawdzić blokadę celu na scenie z kilkoma tablicami oraz przy lekkim
+   drżeniu telefonu;
+3. rozdzielić w modelu danych `trackConfirmed`, `freshMzSuccessful`,
+   `cropSupportsConsensus` i ręczną walidację, aby `confirmed` nie było
+   interpretowane jako jakość konkretnego cropa;
+4. rozszerzyć raport eksperymentalny o strukturalny snapshot termiczny
+   START/STOP; obecnie BAT/TH/HEAD są dostępne w UI/logu, ale nie jako pełny
+   kontrakt sesji;
+5. zdecydować, czy druga kontrolowana seria S2 jest potrzebna po analizie
+   zmienności pierwszego powtórzenia; trzecie powtórzenie wykonywać tylko przy
+   wyniku odstającym lub niejednoznacznym;
+6. po zamrożeniu auto-zoomu przejść do osobnych eksperymentów rozdzielczości
+   źródła i wariantów runtime;
+7. przed finalnym zamrożeniem wersji badawczej wykonać pełny zestaw regresyjny
+   na JVM i urządzeniu.
 
 
 ## Backlog raportu badawczego
@@ -3808,12 +3825,14 @@ Wyników replay i live nie należy łączyć w jedną średnią.
   HUD do wartości przydatnych podczas pracy (`PIPE`, `INF`, `AUX`);
 - wykonać bazową serię R0/R1/R2 po optymalizacji rotacji CameraX, bez zmiany
   modeli i ich wejść;
-- rozszerzyć `CropSamplingPolicy` o zapis przy istotnej poprawie
-  `recognitionConfidence`, bez usuwania wcześniejszych słabszych cropów;
+- utrzymywać aktualną politykę cropów: nowy zapis przy zmianie tekstu,
+  przejściu do stanu stabilnego, poprawie ostrości, poprawie
+  `recognitionConfidence` o co najmniej `0,10` lub po interwale okresowym;
 - wykonać końcowy test animowanego quada i kalibrację unieważniania sceny przy
   ruchu kamery;
-- po audycie czasu zaprojektować `AutoZoomController` i protokół eksperymentu
-  przed/po zoomie; nie mieszać tego eksperymentu z bazowym R0/R1/R2;
+- zweryfikować urządzeniowo wdrożony `AutoZoomController`, blokadę celu,
+  pamięć numeru i powrót do `1x`; eksperyment auto-zoomu nadal traktować
+  oddzielnie od bazowego R0/R1/R2;
 - wykonać kontrolne przebiegi R1 i R2;
 - wykonać pełne A/B/C strategii ROI:
   - R0 — MT pełna klatka;
@@ -3835,8 +3854,9 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 - rozszerzyć `PlateObservation` i raport o strukturę wierszy, jeżeli będzie potrzebna
   do analizy wyników;
 - rozważyć głosowanie temporalne po `(row, col)`;
-- przed eksperymentem zoomu dodać `zoom_ratio`, źródło próby i stan autozoomu do
-  metadanych cropów/raportu;
+- rozbudować metadane auto-zoomu w raporcie sesji; `camera_zoom_ratio` i
+  `capture_source` są już zapisywane dla cropów, natomiast stan kontrolera,
+  wynik blokady celu i pełny cykl zoomu wymagają agregacji na poziomie sesji;
 - ograniczyć logi diagnostyczne;
 - dopracować importer `.alprsession` po stronie Python;
 - dodać jawną bramkę jakości dla INT8.
@@ -3852,6 +3872,117 @@ Wyników replay i live nie należy łączyć w jedną średnią.
 - niezależne śledzenie czterech narożników quada pomiędzy inferencjami MT;
 - wymuszenie konkretnego fizycznego teleobiektywu dopiero jako osobny, zależny od
   urządzenia eksperyment po wersji opartej na ogólnym `CameraControl` zoom.
+
+---
+
+
+## 2026-08-26 — auto-zoom celu, blokada tablicy, pamięć numeru i ograniczenie dryfu trackera
+
+Problem:
+
+- pierwsza koncepcja auto-zoomu nie rozdzielała dostatecznie zmiany skali kamery
+  od rzeczywistej zmiany sceny;
+- podczas zoom-in/zoom-out ramka i tekst mogły znikać albo zostać zastąpione
+  świeżym, ale uboższym wynikiem MT;
+- przy kilku tablicach konieczne było utrzymanie tożsamości dokładnie tej
+  tablicy, która wywołała zbliżenie;
+- tracker Preview mógł przy drżeniu telefonu akumulować błąd translacji;
+- po zbliżeniu potrzebna była wymuszona świeża próba MZ na nowym cropie bez
+  kasowania wcześniejszego konsensusu.
+
+Rozwiązanie:
+
+- dodano `AutoZoomController`, który obsługuje stany `DISABLED`, `READY`,
+  `ZOOM_SETTLING`, `ZOOMED_RETRY` i `RETURNING`;
+- domyślny żądany zoom wynosi `1,8x`, okres stabilizacji po zmianie skali
+  `450 ms`, a maksymalny czas oczekiwania na poprawę wyniku przy zoomie
+  `9 s`;
+- kandydat do zoomu musi mieć co najmniej dwie obserwacje, poprawny quad i być
+  mały albo mieć niski confidence; jedna tablica dostaje co najwyżej jedną
+  próbę auto-zoomu w danej sesji kontrolera;
+- `CameraController` wykonuje płynną zmianę `zoomRatio`, a po zoom-in ustawia
+  punkt AF/AE/AWB w okolicy celu; powrót do `1x` ma osobną, wolniejszą animację;
+- dodano osobną generację transformacji kamery. Wyniki rozpoczęte dla poprzedniej
+  skali są odrzucane bez zerowania logicznej sceny;
+- w `AlprPipeline` i `MobileAlprEngine` kontrolowany zoom jest maskowany przed
+  `SceneChangeDetector`, a po zakończeniu transformacji geometria tracków jest
+  przeliczana przez względny współczynnik zoomu;
+- po zoom-in `PlateTrackCoordinator` przyznaje aktywnemu trackowi jedną świeżą
+  próbę MZ niezależnie od normalnego harmonogramu, nadal wymagając poprawnej
+  geometrii rektyfikacji;
+- dodano `AutoZoomTargetLock` ze stanami `DISABLED`, `ACQUIRING`, `LOCKED`,
+  `UNCERTAIN`, `LOST`. Blokada ocenia ruch, IoU, skalę, proporcje, confidence
+  MT i prosty deskryptor wyglądu;
+- aktywna blokada wyznacza własne ROI `ROI AUTO ZOOM`; w tym stanie okresowy
+  full-frame fallback jest wyłączony, aby inne tablice nie przejęły próby MZ;
+- dodano `PlateAppearanceDescriptor` i pamięć deskryptora wyglądu per track;
+- dodano `AutoZoomRecognitionMemory`. Pusty albo słabszy wynik po zmianie skali
+  nie usuwa ostatniego wiarygodnego numeru, a nowy tekst zastępuje pamięć tylko
+  po przejściu konserwatywnej bramki jakości;
+- `PreviewTrackerDriftGuard` zestawia ruch przyrostowy z ruchem względem ostatniej
+  kotwicy MT i odrzuca aktualizacje o zbyt małym wsparciu, zbyt dużym skoku albo
+  nadmiernym dryfie;
+- `CapturedPlateItem` i `CropMiniReport` zapisują `camera_zoom_ratio` oraz
+  `capture_source`; próba powstała podczas ponownego odczytu po zoomie może być
+  oznaczona jako `auto_zoom_retry`;
+- `CropSamplingPolicy` uwzględnia poprawę `recognitionConfidence` o co najmniej
+  `0,10`, dzięki czemu lepszy crop po zoomie może zostać zachowany bez usuwania
+  wcześniejszego materiału;
+- UI otrzymał kontrolkę auto-zoomu, pulsujący stan aktywny oraz celownik
+  nanoszony na zablokowaną tablicę;
+- `ThermalMonitor` odczytuje dodatkowo `Thermal Headroom`; HEAD jest próbkowany
+  najwyżej raz na `10 s` i pozostaje wskaźnikiem obserwacyjnym.
+
+Semantyka `confirmed`:
+
+- `CapturedPlateItem.confirmed` jest nadal kopią `stable` z temporalnego
+  konsensusu całego tracku;
+- nie oznacza, że konkretny crop samodzielnie potwierdził tekst i nie jest
+  odpowiednikiem ground truth;
+- bieżący crop może mieć `confirmed=true` nawet wtedy, gdy tekst pochodzi z
+  wcześniejszego stanu tracku;
+- docelowo należy rozdzielić `trackConfirmed`, `freshMzSuccessful`,
+  `cropSupportsConsensus` i `manualVerificationStatus`.
+
+Diagnostyka i UI:
+
+- `DiagnosticsActivity` otrzymała tabelę MP/MT/MZ z runtime'em, precyzją,
+  profilem wykonania, liczbą wątków i parametrami wejścia;
+- trwały log jest prezentowany jako osobne wydarzenia z grupowaniem kolejnych
+  eksperymentów R0/R1/R2;
+- ekran główny zachowuje tryb immersyjny, skrócony HUD, timer, monitor termiczny
+  i eksport sesji po zakończeniu eksperymentu;
+- usunięto część nieużywanych zasobów starych przycisków galerii i dodano
+  dedykowane zasoby auto-zoomu oraz tabel diagnostycznych.
+
+Weryfikacja:
+
+- dodano `AutoZoomControllerTest`;
+- dodano `AutoZoomOverlayTransformTest`;
+- dodano `AutoZoomTargetLockTest`;
+- dodano `PreviewTrackerDriftGuardTest`;
+- dodano `AutoZoomRecognitionMemoryTest`;
+- rozszerzono testy `MotionIntensityFilter`, `CropSamplingPolicy`,
+  `PlateTrackCoordinator`, `VehicleRoiSelector` i `MotionBoxTracker`;
+- `testDebugUnitTest` po integracji auto-zoomu zakończył się powodzeniem;
+- `lintDebug` po integracji zakończył się powodzeniem;
+- `app/lint.xml` jawnie wycisza wyłącznie ostrzeżenia o świadomie przypiętych
+  wersjach target API, Android Gradle Plugin i zależności;
+- brak statusu CI na GitHubie nie oznacza błędu — repozytorium nie ma
+  opublikowanego checka dla tego commita;
+- najnowsza korekta pamięci numeru i pełny cykl kamera–zoom–MZ–powrót nie są
+  jeszcze uznane za potwierdzone wizualnie na urządzeniu.
+
+Pozostało:
+
+- wykonać pełny test urządzeniowy auto-zoomu na jednej i kilku tablicach;
+- sprawdzić zachowanie przy drżeniu oraz rzeczywistej zmianie kadru podczas
+  zbliżenia;
+- zweryfikować progi pamięci numeru na rzeczywistych pomyłkach MZ;
+- rozszerzyć raport sesji o agregaty auto-zoomu i strukturalny snapshot
+  termiczny START/STOP;
+- rozdzielić semantykę stabilności tracku od wsparcia konkretnego cropa;
+- dopiero po tej walidacji prowadzić osobny eksperyment „auto-zoom OFF vs ON”.
 
 ---
 
@@ -3898,11 +4029,12 @@ powinny natomiast reprezentować aktualny stan projektu.
 - `docs/alpr-model-v1.schema.json` — schemat pojedynczego modelu;
 - `docs/alpr-package-v1.schema.json` — schemat kompletnej paczki MT+MZ albo
   MP+MT+MZ;
-- `docs/mobile_architecture.md` — opis potoku wykonawczego i interfejsu; wymaga
-  synchronizacji z częścią zmian z 2026-08-23–25;
-- `docs/mobile_research_export.md` — kontrakt eksportu `.alprsession` i paczki
-  TeX; wymaga uzupełnienia o bezpośredni eksport eksperymentu i telemetrię
-  termiczną;
+- `docs/mobile_architecture.md` — opis potoku wykonawczego, trackingu, trybu
+  eksperymentalnego i auto-zoomu; zsynchronizowany z kodem po audycie
+  2026-08-26;
+- `docs/mobile_research_export.md` — kontrakt eksportu `.alprsession`, paczki
+  TeX i bieżącej semantyki metadanych cropów; zsynchronizowany z kodem po
+  audycie 2026-08-26;
 - `docs/alpr-mobile-research-bundle-v1.schema.json` — schemat manifestu pełnego
   eksportu badawczego;
 - `docs/model_package_test_strategy.md` — strategia fixtures, parytetu,
@@ -3928,11 +4060,13 @@ dzienniku, interfejsie aplikacji i generowanych raportach badawczych.
 | **ABI** | *Application Binary Interface* — interfejs binarny platformy, np. `arm64-v8a` |
 | **AE** | *Auto Exposure* — automatyczna ekspozycja kamery |
 | **AF** | *Auto Focus* — automatyczne ustawianie ostrości |
+| **AWB** | *Auto White Balance* — automatyczny balans bieli kamery |
 | **ALPR** | *Automatic License Plate Recognition* — automatyczne rozpoznawanie tablic rejestracyjnych |
 | **ANPR** | *Automatic Number Plate Recognition* — alternatywna nazwa systemów ALPR |
 | **API** | *Application Programming Interface* — interfejs programistyczny |
 | **APK** | *Android Package Kit* — instalacyjny pakiet aplikacji Android |
 | **AUX** | *auxiliary time* — suma jawnie zmierzonych operacji pomocniczych poza samą inferencją modeli |
+| **AUTO-ZOOM** | automatyczna, kontrolowana zmiana `zoomRatio` kamery wykonywana dla wybranego tracku tablicy w celu uzyskania lepszego cropu i ponownej próby MZ |
 | **BAT** | temperatura baterii raportowana przez Androida, podawana w `°C` |
 | **CAM** | łączny zmierzony czas przygotowania obrazu kamery w pipeline |
 | **CAM_BITMAP / TO_BITMAP** | czas konwersji `ImageProxy` do `Bitmap` |
@@ -3969,6 +4103,7 @@ dzienniku, interfejsie aplikacji i generowanych raportach badawczych.
 | **JSON** | *JavaScript Object Notation* — tekstowy format danych strukturalnych |
 | **JVM** | *Java Virtual Machine* — maszyna wirtualna uruchamiająca m.in. testy jednostkowe Java |
 | **LiteRT / TFLite** | mobilny runtime modeli wywodzący się z TensorFlow Lite |
+| **LOCK** | blokada tożsamości celu auto-zoomu; stan logiczny utrzymujący tę samą tablicę mimo zmiany skali i ruchu |
 | **mAP** | *mean Average Precision* — średnia precyzja detekcji dla zadanego zakresu progów IoU |
 | **mAP50-95** | mAP liczony dla progów IoU od 0,50 do 0,95 |
 | **MB** | megabajt; w dzienniku używany przy orientacyjnych rozmiarach danych i plików |
